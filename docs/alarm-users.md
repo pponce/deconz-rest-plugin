@@ -177,3 +177,31 @@ requests, disabled/re-enabled users, PIN edits, deletion/recreation, nine-slot c
 stale revisions, and transaction rollback on failed receipt insertion.
 Real IAS messages, Homebridge compatibility and household installation still
 require supervised verification; these are not established by build/store tests.
+
+## Required keypad DDF scope for upstream submission
+
+The intended upstream contribution must include the household-tested Xfinity
+URC4450BC0-X-R DDF changes, plus any further DDF changes made during this work.
+The current feature branch implements the alarm-user code; it does not yet port
+that custom device definition into the upstream device tree.
+
+The existing custom definition separates IAS ACE action events (0x0501) from
+IAS Zone alarm/tamper/battery reporting (0x0500), preserving resource identities.
+Household testing of the custom definition verified that a Zone Status read no
+longer produces a false open-like keypad event. Preserve this regression case,
+fresh repeated code entries and explicit native arming/disarming when integrating
+the feature plugin. Building/installing the shared library alone does not activate
+a DDF or replace a local override.
+
+Before upstream submission, reconcile the sanitized custom definition with the
+current upstream Xfinity DDF, include the device-file diff and migration evidence,
+and verify local-override precedence. Include only generic device definitions and
+sanitized results, never a household database, PIN, API key or device mapping.
+
+## Household build preflight update
+
+Owner reports baseline and feature 79551b7 built successfully on Linux with Qt
+5.15.13 and installed deCONZ 2.33.2 amd64; all 128 checks passed. Feature shared
+library dependencies resolve on the host. Headless deCONZ and dependent services
+are running; the active database and custom devices directory were identified
+privately. No replacement plugin has been installed or runtime-tested yet.
