@@ -1,3 +1,4 @@
+#include "alarm_user_schedule.h"
 /*
  * Copyright (c) 2021 dresden elektronik ingenieurtechnik gmbh.
  * All rights reserved.
@@ -191,6 +192,7 @@ static QVariantMap userToMap(const AlarmUsers::User &u)
     map[QLatin1String("api_arm_disarm")] = u.apiArmDisarm;
     map[QLatin1String("remaining_uses")] = u.remaining < 0 ? QVariant() : QVariant(qlonglong(u.remaining));
     map[QLatin1String("revision")] = qlonglong(u.revision);
+    map[QLatin1String("schedule")] = u.schedule.empty() ? QVariant() : QJsonDocument::fromJson(QByteArray::fromStdString(u.schedule)).toVariant();
     return map; // never hash or PIN
 }
 
@@ -209,7 +211,8 @@ static int handleAlarmUsers(const ApiRequest &req, ApiResponse &rsp, AlarmSystem
         if (!sys->userManagementEnabled(managed)) return fail("storage_error", true);
         rsp.map[QLatin1String("managed")] = managed;
         rsp.map[QLatin1String("api_arm_disarm")] = true;
-        rsp.map[QLatin1String("schedules")] = false;
+        rsp.map[QLatin1String("schedules")] = true;
+        rsp.map[QLatin1String("schedule_version")] = 1;
         rsp.map[QLatin1String("max_users")] = AlarmUsers::MaxUsers;
         rsp.httpStatus = HttpStatusOk;
         return REQ_READY_SEND;
@@ -252,12 +255,20 @@ static int handleAlarmUsers(const ApiRequest &req, ApiResponse &rsp, AlarmSystem
         rsp.map[QLatin1String("deleted")] = slot;
         return REQ_READY_SEND;
     }
-    const QStringList allowed = {"revision", "name", "pin", "enabled", "remaining_uses", "api_arm_disarm"};
+    const QStringList allowed = {"revision", "name", "pin", "enabled", "remaining_uses", "api_arm_disarm", "schedule"};
     for (auto i = body.cbegin(); i != body.cend(); ++i) if (!allowed.contains(i.key())) return fail("unknown_field");
     AlarmUsers::User u;
     u.apiArmDisarm = slot == 0; // only the default Main account starts API-enabled
     if (found != users.end()) u = *found;
     u.slot = slot;
+    if (body.contains(QLatin1String("schedule"))) {
+        const QVariant value = body.value(QLatin1String("schedule"));
+        if (value.isNull()) u.schedule.clear();
+        else if (value.type() == QVariant::Map) {
+            u.schedule = QJsonDocument::fromVariant(value).toJson(QJsonDocument::Compact).toStdString();
+            if (AlarmUsers::checkSchedule(u.schedule, 0) != 1) return fail("invalid_schedule");
+        } else return fail("invalid_schedule");
+    }
     QString pin;
     if (body.contains(QLatin1String("pin"))) {
         const QVariant value = body.value(QLatin1String("pin"));

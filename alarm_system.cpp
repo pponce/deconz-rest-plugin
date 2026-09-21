@@ -1,3 +1,4 @@
+#include "alarm_user_schedule.h"
 /*
  * Copyright (c) 2021 dresden elektronik ingenieurtechnik gmbh.
  * All rights reserved.
@@ -449,7 +450,7 @@ void AlarmSystem::didSetValue(ResourceItem *i)
 static AlarmUsers::Store userStore()
 {
     return AlarmUsers::Store(DB_AlarmUserConnection(), CRYPTO_ScryptVerify,
-        [](const std::string &pin) { return CRYPTO_ScryptPassword(pin, CRYPTO_GenerateSalt()); });
+        [](const std::string &pin) { return CRYPTO_ScryptPassword(pin, CRYPTO_GenerateSalt()); }, AlarmUsers::checkSchedule);
 }
 
 bool AlarmSystem::isValidCode(const QString &code, quint64 srcExtAddress)

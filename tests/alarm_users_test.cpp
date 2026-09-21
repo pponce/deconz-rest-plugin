@@ -36,6 +36,48 @@ static User add(Store &s,int slot,const std::string &pin,int64_t uses=-1) {
     User u;u.slot=slot;u.name="User "+std::to_string(slot);u.remaining=uses;std::string err;
     CHECK(s.put(1,u,pin,0,err));return u;
 }
+static void schedulePolicyTests() {
+    sqlite3 *db=nullptr; CHECK(sqlite3_open(":memory:",&db)==SQLITE_OK);
+    sql(db,"CREATE TABLE secrets(uniqueid TEXT PRIMARY KEY,secret TEXT,state INTEGER)");
+    // Inject deterministic schedule evaluation to test transaction behavior independently of Qt.
+    auto check=[](const std::string &policy,int64_t now) {
+        if(policy!="window")return -1;
+        if(now==0)return 1;
+        return now>=100000 && now<120000 ? 1 : 0;
+    };
+    Store store(db,verify,hash,check); auto user=add(store,1,"2468",3);std::string err;
+    user.schedule="window";user.apiArmDisarm=true;CHECK(store.put(1,user,"",user.revision,err));
+    CHECK(!store.restCode(1,"2468",99999));CHECK(store.restCode(1,"2468",100000));
+    CHECK(store.authorize(1,"pad",1,1,0,"2468",99999,true).response==4);
+    CHECK(get(store,1).remaining==3);
+    auto accepted=store.authorize(1,"pad",1,2,0,"2468",119000,true);
+    CHECK(accepted.response==6 && accepted.user.remaining==2);
+    // A receipt crossing expiry acknowledges only the old request; no second use or event.
+    auto duplicate=store.authorize(1,"pad",1,2,0,"2468",121000,true);
+    CHECK(duplicate.ok && duplicate.duplicate && duplicate.user.remaining==2);
+    CHECK(store.authorize(1,"pad",1,3,0,"2468",121001,true).response==4);
+    CHECK(!store.restCode(1,"2468",120000));
+    user=get(store,1);user.enabled=false;CHECK(store.put(1,user,"",user.revision,err));
+    CHECK(!store.restCode(1,"2468",110000));
+    user.enabled=true;CHECK(store.put(1,user,"",user.revision,err));CHECK(user.remaining==2);
+    CHECK(!store.restCode(1,"2468",130000));
+    Store restarted(db,verify,hash,check);CHECK(get(restarted,1).schedule=="window");
+    CHECK(!restarted.restCode(1,"2468",130000));
+    Store noEvaluator(db,verify,hash);CHECK(!noEvaluator.restCode(1,"2468",110000));
+    CHECK(!noEvaluator.authorize(1,"pad",1,4,0,"2468",110000,true).ok);
+    user=get(store,1);user.schedule="bad";CHECK(!store.put(1,user,"",user.revision,err));
+    CHECK(err=="invalid_schedule" && get(store,1).schedule=="window");
+    sql(db,"CREATE TRIGGER deny_schedule BEFORE INSERT ON alarm_user_schedules_v1 BEGIN SELECT RAISE(ABORT,'test'); END");
+    user=get(store,1);user.name="changed";CHECK(!store.put(1,user,"",user.revision,err));CHECK(get(store,1).name!="changed");
+    sql(db,"DROP TRIGGER deny_schedule");
+    user=get(store,1);CHECK(store.erase(1,1,user.revision));
+    auto replacement=add(store,1,"2468");CHECK(replacement.schedule.empty());
+    // Slot 0 is not a backend privilege exception: UI protects its Homebridge role separately.
+    auto main=add(store,0,"1357");main.schedule="window";main.apiArmDisarm=true;CHECK(store.put(1,main,"",main.revision,err));
+    CHECK(!store.restCode(1,"1357",130000));CHECK(store.setMainCode(1,"1358"));
+    CHECK(get(store,0).schedule=="window" && !store.restCode(1,"1358",130000));
+    CHECK(sqlite3_close(db)==SQLITE_OK);
+}
 static void apiPermissionTests() {
     const char *path="alarm-api-permission-test.sqlite"; std::remove(path);
     sqlite3 *db=nullptr; CHECK(sqlite3_open(path,&db)==SQLITE_OK);
@@ -199,6 +241,7 @@ int main() {
     CHECK(reopened.managementEnabled(1,managed) && managed); // Never silently fall back.
     CHECK(sqlite3_close(db)==SQLITE_OK);std::remove(path);
     apiPermissionTests();
+    schedulePolicyTests();
     std::cout<<"PASS: "<<assertions<<" checks (SQLite persistence, scrypt fixtures, concurrency, policy, retries)\n";
  } catch(const std::exception &e) {std::cerr<<e.what()<<"\n";return 1;}
 }

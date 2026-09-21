@@ -19,3 +19,6 @@ build*
 # Household recovery snapshots contain private gateway data and credentials.
 .local-backups/
 
+
+# Track schedule build source; generated builds remain ignored.
+!/tools/build-schedule-update.py

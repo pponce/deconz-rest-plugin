@@ -59,6 +59,10 @@ g++ -std=c++14 -Wall -Wextra -Werror -I"$build_root/feature-source" \
     "$build_root/feature-source/tests/alarm_users_test.cpp" \
     -lsqlite3 -lcrypto -pthread -o "$build_root/alarm_users_test"
 (cd "$build_root" && ./alarm_users_test) | tee "$build_root/tests.log"
+g++ -std=c++14 -Wall -Wextra -Werror -fPIC -I"$build_root/feature-source" \
+    "$build_root/feature-source/tests/alarm_schedule_test.cpp" \
+    $(pkg-config --cflags --libs Qt5Core) -o "$build_root/alarm_schedule_test"
+(cd "$build_root" && ./alarm_schedule_test) | tee "$build_root/schedule-tests.log"
 sha256sum "$build_root/"{baseline,feature}-stage/share/deCONZ/plugins/libde_rest_plugin.so > "$build_root/plugin-hashes.txt"
 echo 'Both plugin builds and user-store tests passed. Nothing installed or restarted.'
 echo "Keep the staged binaries and build records at: $build_root"

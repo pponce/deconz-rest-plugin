@@ -60,7 +60,7 @@ Disabled, exhausted and incorrect PINs produce the existing invalid_code result.
 The household controller therefore retains its existing invalid-code close behavior,
 subject to its existing ready/busy/position guards. Storage errors produce not_ready,
 not invalid_code, to avoid turning database failure into a door-close request.
-Expiration and recurring schedules are phase 6 and are NOT implemented here.
+Expiration and recurring schedules are implemented in the staged schedule extension; see [schedule policy and commissioning limits](alarm-user-schedules.md). The previously installed API-permission runtime does not include them.
 
 ## API
 
@@ -75,7 +75,7 @@ available from the explicit users endpoint; PINs and hashes are never returned.
 
 PUT creates with revision 0 and required name/pin. Updates require the revision
 returned by GET; omitted fields are preserved. Fields: revision, name, pin,
-enabled, remaining_uses, api_arm_disarm. No implicit retries after revision conflicts: GET again
+enabled, remaining_uses, api_arm_disarm, schedule. No implicit retries after revision conflicts: GET again
 and review. DELETE takes only a revision in its JSON body. Unknown fields, invalid
 types and numeric PINs are rejected. Names allow up to 64 UTF-8 bytes without
 ASCII control characters. remaining_uses accepts null or an integer 0–1000000.

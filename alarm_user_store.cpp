@@ -2,6 +2,7 @@
 #include <sqlite3.h>
 #include <algorithm>
 #include <utility>
+#include <chrono>
 
 namespace AlarmUsers {
 namespace {
@@ -37,7 +38,8 @@ bool mirror(sqlite3 *db, int alarm, const User &u) {
     return s.step() == SQLITE_DONE;
 }
 }
-Store::Store(sqlite3 *d, Verify v, Hash h) : db(d), verify(std::move(v)), hash(std::move(h)) {}
+Store::Store(sqlite3 *d, Verify v, Hash h, ScheduleCheck check)
+    : db(d), verify(std::move(v)), hash(std::move(h)), scheduleCheck(std::move(check)) {}
 
 bool Store::managementEnabled(int alarm, bool &enabled) {
     enabled = false;
@@ -77,6 +79,7 @@ bool Store::init(int alarm) {
         "sequence INTEGER NOT NULL,mode INTEGER NOT NULL,created INTEGER NOT NULL,"
         "uid TEXT NOT NULL,response INTEGER NOT NULL,eventid TEXT NOT NULL,"
         "PRIMARY KEY(alarm,source,endpoint,sequence))")) return false;
+    if (!exec(db, "CREATE TABLE IF NOT EXISTS alarm_user_schedules_v1 (uid TEXT PRIMARY KEY, policy TEXT NOT NULL)")) return false;
     bool permissionColumn = false;
     {
         Statement columns(db, "PRAGMA table_info(alarm_users_v1)");
@@ -116,7 +119,7 @@ bool Store::init(int alarm) {
 }
 bool Store::read(int alarm, std::vector<User> &users) {
     users.clear();
-    Statement s(db, "SELECT slot,uid,name,hash,enabled,remaining,revision,api_arm_disarm FROM alarm_users_v1 WHERE alarm=? ORDER BY slot");
+    Statement s(db, "SELECT slot,u.uid,name,hash,enabled,remaining,revision,api_arm_disarm,coalesce(p.policy,'') FROM alarm_users_v1 u LEFT JOIN alarm_user_schedules_v1 p ON p.uid=u.uid WHERE alarm=? ORDER BY slot");
     if (!s.valid()) return false;
     s.number(1, alarm);
     int rc;
@@ -125,6 +128,7 @@ bool Store::read(int alarm, std::vector<User> &users) {
         u.enabled = s.number(4) != 0; u.remaining = s.number(5); u.revision = s.number(6);
         if (s.number(7) != 0 && s.number(7) != 1) return false;
         u.apiArmDisarm = s.number(7) == 1;
+        u.schedule = s.text(8);
         users.push_back(u);
     }
     return rc == SQLITE_DONE;
@@ -138,6 +142,9 @@ bool Store::put(int alarm, User &u, const std::string &pin, int64_t revision, st
     if (u.slot < 0 || u.slot >= MaxUsers || u.name.empty() || u.name.size() > 64 ||
         std::any_of(u.name.begin(), u.name.end(), [](unsigned char c) { return c < 32 || c == 127; }) ||
         u.remaining < -1 || u.remaining > 1000000 || revision < 0 || (!pin.empty() && !validPin(pin))) return false;
+    if (!u.schedule.empty() && (u.schedule.size() > 8192 || !scheduleCheck || scheduleCheck(u.schedule, 0) != 1)) {
+        error = "invalid_schedule"; return false;
+    }
     error = "storage_error";
     Transaction t(db); std::vector<User> users;
     if (!t.active || !init(alarm) || !read(alarm, users)) return false;
@@ -158,7 +165,11 @@ bool Store::put(int alarm, User &u, const std::string &pin, int64_t revision, st
     if (!s.valid()) return false;
     s.number(1,alarm); s.number(2,u.slot); s.number(3,alarm); s.number(4,u.slot);
     s.text(5,u.name); s.text(6,u.hash); s.number(7,u.enabled); s.number(8,u.remaining); s.number(9,revision+1); s.number(10,u.apiArmDisarm);
-    if (s.step()!=SQLITE_DONE || !mirror(db,alarm,u) || !activate(alarm) || !read(alarm,users) || !t.commit()) return false;
+    if (s.step()!=SQLITE_DONE) return false;
+    Statement policy(db, "INSERT OR REPLACE INTO alarm_user_schedules_v1 SELECT uid,? FROM alarm_users_v1 WHERE alarm=? AND slot=?");
+    if (!policy.valid()) return false;
+    policy.text(1,u.schedule); policy.number(2,alarm); policy.number(3,u.slot);
+    if (policy.step()!=SQLITE_DONE || !mirror(db,alarm,u) || !activate(alarm) || !read(alarm,users) || !t.commit()) return false;
     u = *std::find_if(users.begin(),users.end(),[&](const User &x){return x.slot==u.slot;});
     error.clear(); return true;
 }
@@ -175,13 +186,17 @@ bool Store::erase(int alarm, int slot, int64_t revision) {
         if (!d.valid()) return false;
         d.text(1,legacyKey(alarm)); if (d.step()!=SQLITE_DONE) return false;
     }
+    if (!exec(db,"DELETE FROM alarm_user_schedules_v1 WHERE uid NOT IN (SELECT uid FROM alarm_users_v1)")) return false;
     return activate(alarm) && t.commit();
 }
-bool Store::restCode(int alarm, const std::string &pin) {
+bool Store::restCode(int alarm, const std::string &pin, int64_t now) {
+    if (now == -1) now = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
     std::vector<User> users;
     if (!list(alarm,users)) return false;
     for (const auto &u:users)
-        if (u.apiArmDisarm && u.enabled && u.remaining!=0 && verify(u.hash,pin)) return true;
+        if (u.apiArmDisarm && u.enabled && u.remaining!=0 && verify(u.hash,pin))
+            return u.schedule.empty() || (now > 0 && scheduleCheck && scheduleCheck(u.schedule,now) == 1);
     return false;
 }
 bool Store::setMainCode(int alarm, const std::string &pin) {
@@ -220,7 +235,12 @@ Result Store::authorize(int alarm,const std::string &source,int endpoint,int seq
     } else if (rc!=SQLITE_DONE) return result;
     previous.step(); // finish read before writes/commit
     result.response=4;
-    if (matched.slot>=0 && matched.enabled && matched.remaining!=0) {
+    int scheduled = 1;
+    if (matched.slot >= 0 && !matched.schedule.empty()) {
+        scheduled = scheduleCheck ? scheduleCheck(matched.schedule,now) : -1;
+        if (scheduled < 0) return result; // policy/clock failure is not_ready, never a close request
+    }
+    if (matched.slot>=0 && matched.enabled && matched.remaining!=0 && scheduled == 1) {
         result.response=(mode==0 && alreadyDisarmed)?6:mode;
         // Only accepted physical keypad DISARM consumes a use. REST and ARM do not.
         if (mode==0 && matched.remaining>0) --matched.remaining;
