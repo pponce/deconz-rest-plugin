@@ -112,6 +112,13 @@ restore the reviewed pre-install DB snapshot too. Preserve a private post-test D
 copy first if retaining new configuration/counts matters. Do not swap databases
 while deCONZ is running or let GUI/headless instances access different snapshots.
 
+## Household maintenance helper
+
+The private backup, supervised installation and rollback procedure is documented
+in [garage-deconz-maintenance.md](garage-deconz-maintenance.md). Snapshots stay in
+the checkout's ignored `.local-backups/` directory. First feature commissioning
+uses the existing PIN/controller behavior before adding users or allowances.
+
 ## Build, staging and recovery gate
 
 Follow BUILDING.md for Qt5 dependencies on Linux Mint. Keep a clean upstream
