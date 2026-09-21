@@ -188,6 +188,7 @@ static QVariantMap userToMap(const AlarmUsers::User &u)
     map[QLatin1String("slot")] = u.slot;
     map[QLatin1String("name")] = QString::fromStdString(u.name);
     map[QLatin1String("enabled")] = u.enabled;
+    map[QLatin1String("api_arm_disarm")] = u.apiArmDisarm;
     map[QLatin1String("remaining_uses")] = u.remaining < 0 ? QVariant() : QVariant(qlonglong(u.remaining));
     map[QLatin1String("revision")] = qlonglong(u.revision);
     return map; // never hash or PIN
@@ -203,6 +204,16 @@ static int handleAlarmUsers(const ApiRequest &req, ApiResponse &rsp, AlarmSystem
         return REQ_READY_SEND;
     };
     if (!sys) return fail("alarm_not_found");
+    if (req.hdr.pathComponentsCount() == 6 && req.hdr.pathAt(5) == QLatin1String("capabilities") && req.hdr.httpMethod() == HttpGet) {
+        bool managed = false;
+        if (!sys->userManagementEnabled(managed)) return fail("storage_error", true);
+        rsp.map[QLatin1String("managed")] = managed;
+        rsp.map[QLatin1String("api_arm_disarm")] = true;
+        rsp.map[QLatin1String("schedules")] = false;
+        rsp.map[QLatin1String("max_users")] = AlarmUsers::MaxUsers;
+        rsp.httpStatus = HttpStatusOk;
+        return REQ_READY_SEND;
+    }
     std::vector<AlarmUsers::User> users;
     if (!sys->users(users)) return fail("storage_error", true);
     if (req.hdr.pathComponentsCount() == 5 && req.hdr.httpMethod() == HttpGet) {
@@ -241,9 +252,10 @@ static int handleAlarmUsers(const ApiRequest &req, ApiResponse &rsp, AlarmSystem
         rsp.map[QLatin1String("deleted")] = slot;
         return REQ_READY_SEND;
     }
-    const QStringList allowed = {"revision", "name", "pin", "enabled", "remaining_uses"};
+    const QStringList allowed = {"revision", "name", "pin", "enabled", "remaining_uses", "api_arm_disarm"};
     for (auto i = body.cbegin(); i != body.cend(); ++i) if (!allowed.contains(i.key())) return fail("unknown_field");
     AlarmUsers::User u;
+    u.apiArmDisarm = slot == 0; // only the default Main account starts API-enabled
     if (found != users.end()) u = *found;
     u.slot = slot;
     QString pin;
@@ -261,6 +273,11 @@ static int handleAlarmUsers(const ApiRequest &req, ApiResponse &rsp, AlarmSystem
         const QVariant value = body.value(QLatin1String("enabled"));
         if (value.type() != QVariant::Bool) return fail("invalid_enabled");
         u.enabled = value.toBool();
+    }
+    if (body.contains(QLatin1String("api_arm_disarm"))) {
+        const QVariant value = body.value(QLatin1String("api_arm_disarm"));
+        if (value.type() != QVariant::Bool) return fail("invalid_api_arm_disarm");
+        u.apiArmDisarm = value.toBool();
     }
     if (body.contains(QLatin1String("remaining_uses"))) {
         const QVariant value = body.value(QLatin1String("remaining_uses"));
@@ -843,4 +860,5 @@ static int deleteAlarmSystemDevice(const ApiRequest &req, ApiResponse &rsp, Alar
 
     return REQ_READY_SEND;
 }
+
 

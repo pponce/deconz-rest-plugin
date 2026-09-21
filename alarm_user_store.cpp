@@ -77,8 +77,21 @@ bool Store::init(int alarm) {
         "sequence INTEGER NOT NULL,mode INTEGER NOT NULL,created INTEGER NOT NULL,"
         "uid TEXT NOT NULL,response INTEGER NOT NULL,eventid TEXT NOT NULL,"
         "PRIMARY KEY(alarm,source,endpoint,sequence))")) return false;
-    Statement s(db, "INSERT OR IGNORE INTO alarm_users_v1 "
-        "SELECT ?,0,lower(hex(randomblob(16))),'Main',secret,CASE WHEN state=1 THEN 1 ELSE 0 END,-1,1 "
+    bool permissionColumn = false;
+    {
+        Statement columns(db, "PRAGMA table_info(alarm_users_v1)");
+        if (!columns.valid()) return false;
+        int rc;
+        while ((rc = columns.step()) == SQLITE_ROW)
+            if (columns.text(1) == "api_arm_disarm") permissionColumn = true;
+        if (rc != SQLITE_DONE) return false;
+    }
+    if (!permissionColumn) {
+        if (!exec(db, "ALTER TABLE alarm_users_v1 ADD COLUMN api_arm_disarm INTEGER NOT NULL DEFAULT 0 CHECK(api_arm_disarm IN (0,1))") ||
+            !exec(db, "UPDATE alarm_users_v1 SET api_arm_disarm=1 WHERE slot=0")) return false;
+    }
+    Statement s(db, "INSERT OR IGNORE INTO alarm_users_v1(alarm,slot,uid,name,hash,enabled,remaining,revision,api_arm_disarm) "
+        "SELECT ?,0,lower(hex(randomblob(16))),'Main',secret,CASE WHEN state=1 THEN 1 ELSE 0 END,-1,1,1 "
         "FROM secrets WHERE uniqueid=? AND length(secret)>0");
     if (!s.valid()) return false;
     s.number(1, alarm); s.text(2, legacyKey(alarm));
@@ -103,13 +116,15 @@ bool Store::init(int alarm) {
 }
 bool Store::read(int alarm, std::vector<User> &users) {
     users.clear();
-    Statement s(db, "SELECT slot,uid,name,hash,enabled,remaining,revision FROM alarm_users_v1 WHERE alarm=? ORDER BY slot");
+    Statement s(db, "SELECT slot,uid,name,hash,enabled,remaining,revision,api_arm_disarm FROM alarm_users_v1 WHERE alarm=? ORDER BY slot");
     if (!s.valid()) return false;
     s.number(1, alarm);
     int rc;
     while ((rc = s.step()) == SQLITE_ROW) {
         User u; u.slot = int(s.number(0)); u.id = s.text(1); u.name = s.text(2); u.hash = s.text(3);
         u.enabled = s.number(4) != 0; u.remaining = s.number(5); u.revision = s.number(6);
+        if (s.number(7) != 0 && s.number(7) != 1) return false;
+        u.apiArmDisarm = s.number(7) == 1;
         users.push_back(u);
     }
     return rc == SQLITE_DONE;
@@ -138,11 +153,11 @@ bool Store::put(int alarm, User &u, const std::string &pin, int64_t revision, st
         u.hash = hash(pin);
         if (u.hash.empty()) return false;
     } else u.hash = old->hash;
-    Statement s(db, "INSERT OR REPLACE INTO alarm_users_v1(alarm,slot,uid,name,hash,enabled,remaining,revision) "
-        "VALUES(?,?,coalesce((SELECT uid FROM alarm_users_v1 WHERE alarm=? AND slot=?),lower(hex(randomblob(16)))),?,?,?,?,?)");
+    Statement s(db, "INSERT OR REPLACE INTO alarm_users_v1(alarm,slot,uid,name,hash,enabled,remaining,revision,api_arm_disarm) "
+        "VALUES(?,?,coalesce((SELECT uid FROM alarm_users_v1 WHERE alarm=? AND slot=?),lower(hex(randomblob(16)))),?,?,?,?,?,?)");
     if (!s.valid()) return false;
     s.number(1,alarm); s.number(2,u.slot); s.number(3,alarm); s.number(4,u.slot);
-    s.text(5,u.name); s.text(6,u.hash); s.number(7,u.enabled); s.number(8,u.remaining); s.number(9,revision+1);
+    s.text(5,u.name); s.text(6,u.hash); s.number(7,u.enabled); s.number(8,u.remaining); s.number(9,revision+1); s.number(10,u.apiArmDisarm);
     if (s.step()!=SQLITE_DONE || !mirror(db,alarm,u) || !activate(alarm) || !read(alarm,users) || !t.commit()) return false;
     u = *std::find_if(users.begin(),users.end(),[&](const User &x){return x.slot==u.slot;});
     error.clear(); return true;
@@ -162,16 +177,17 @@ bool Store::erase(int alarm, int slot, int64_t revision) {
     }
     return activate(alarm) && t.commit();
 }
-bool Store::mainCode(int alarm, const std::string &pin) {
+bool Store::restCode(int alarm, const std::string &pin) {
     std::vector<User> users;
     if (!list(alarm,users)) return false;
-    for (const auto &u:users) if (u.slot==0) return u.enabled && u.remaining!=0 && verify(u.hash,pin);
+    for (const auto &u:users)
+        if (u.apiArmDisarm && u.enabled && u.remaining!=0 && verify(u.hash,pin)) return true;
     return false;
 }
 bool Store::setMainCode(int alarm, const std::string &pin) {
     std::vector<User> users;
     if (!list(alarm,users)) return false;
-    User u; u.slot=0; u.name="Main";
+    User u; u.slot=0; u.name="Main"; u.apiArmDisarm=true;
     for (const auto &x:users) if (x.slot==0) u=x;
     std::string error;
     return put(alarm,u,pin,u.revision,error); // preserves disabled/exhausted status
@@ -231,3 +247,4 @@ Result Store::authorize(int alarm,const std::string &source,int endpoint,int seq
     result.ok=t.commit(); return result;
 }
 }
+

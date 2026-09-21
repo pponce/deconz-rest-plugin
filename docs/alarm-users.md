@@ -34,14 +34,15 @@ user-store implementation. No garage close/open logic is added to deCONZ.
 ## Scope and policy
 
 Nine slots, 0–8, per alarm system. On using the user API, slot 0 imports the existing main PIN hash
-unchanged and remains the only credential accepted by the legacy REST arm/disarm
-API used by Homebridge. The main user can be renamed, edited, disabled or deleted;
-disabling/deleting it intentionally disables Homebridge alarm commands until a
-usable slot-0 code is restored. Changing its PIN also requires updating the
+unchanged and defaults to API arm/disarm enabled. Other users default to API arm/disarm disabled.
+Any eligible user with api_arm_disarm=true can authenticate REST alarm commands;
+Homebridge still uses one separately configured private PIN. The main user can be renamed, edited, disabled or deleted;
+disabling/deleting the account whose PIN Homebridge uses disables its alarm commands
+until a usable API-enabled credential is configured there. Changing its PIN also requires updating the
 separate private homebridge-deCONZ PIN setting.
 
 Every account has a stable random identity, name, enabled flag, remaining-use
-allowance and revision. Renaming/replacing a PIN preserves identity; deletion
+allowance, api_arm_disarm permission and revision. Renaming/replacing a PIN preserves identity; deletion
 removes the credential; recreating a slot creates a new identity. PINs must be
 unique across all accounts, including disabled accounts. New/replacement PINs
 are 4–16 ASCII digits; retain the length supported by the physical keypad.
@@ -74,7 +75,7 @@ available from the explicit users endpoint; PINs and hashes are never returned.
 
 PUT creates with revision 0 and required name/pin. Updates require the revision
 returned by GET; omitted fields are preserved. Fields: revision, name, pin,
-enabled, remaining_uses. No implicit retries after revision conflicts: GET again
+enabled, remaining_uses, api_arm_disarm. No implicit retries after revision conflicts: GET again
 and review. DELETE takes only a revision in its JSON body. Unknown fields, invalid
 types and numeric PINs are rejected. Names allow up to 64 UTF-8 bytes without
 ASCII control characters. remaining_uses accepts null or an integer 0–1000000.
@@ -247,3 +248,47 @@ above and must not be used for the requested compatibility-first commissioning.
 Rebuild the updated implementation before feature installation. Store checks now
 include default-off/no-schema behavior, GET without opt-in, legacy PIN edits after
 GET, failed activation rollback, per-alarm isolation and persistent activation.
+
+
+## Per-user alarm API permission
+
+UI label: **Allow alarm arm/disarm via API**. Boolean `api_arm_disarm` is returned
+by user GETs and accepted by revision-checked PUTs. Omission preserves an existing
+value; a newly created Main/slot 0 defaults true and other slots default false.
+Numeric/string/null values are rejected. Multiple users can be API-enabled.
+
+GET `/api/<key>/alarmsystems/<id>/users/capabilities` reports `api_arm_disarm: true`,
+`managed`, `max_users: 9`, and `schedules: false`. It is read-only and does not
+create preview users or enable managed mode.
+
+The additive `api_arm_disarm` column is migrated transactionally on user-store
+access. Pre-existing slot-0 accounts gain the default permission once; other
+accounts default off. Names, hashes, enabled flags, counts, identities and
+revisions are preserved. Explicit revocation survives GETs, restart and legacy
+config/code0 PIN updates. Deleting/recreating a guest does not inherit its old
+permission. Failed migration/mutation rolls back; storage errors deny access.
+
+With management disabled, the original single-code REST and physical keypad
+behavior is unchanged. An explicit successful users PUT/DELETE still activates
+managed mode. GET alone does not. With management enabled, REST arm_away,
+arm_stay, arm_night and disarm accept any API-enabled, enabled, non-exhausted user.
+The existing request field is still called `code0`; its name no longer limits
+authentication to slot 0 in managed mode. REST does not consume uses or change
+user revisions. API keys are still required; this PIN permission does not grant
+user administration, configuration, device or motor control.
+
+Physical keypad permissions, accepted events, duplicate handling and usage
+consumption are unchanged. API permission off does not prevent an eligible
+physical PIN from arming/disarming. Distinct physical arm/disarm permissions are
+a potential future option, not included here.
+
+Homebridge user selection belongs in the local web service, not this generic
+deCONZ permission. This change neither changes Homebridge's private PIN nor
+selects a new Homebridge user. The coordinated update/recovery workflow, API
+activity attribution, persistent web activity history and schedules remain later
+work. Existing physical access events remain available for an observation-only
+collector; do not attach them as a second motor trigger.
+
+A post-install unchanged-code check demonstrates compatibility only. It does not
+commission guest users, API grants/revocation or Homebridge credential switching.
+Managed-user mutation testing requires a new private backup and supervised plan.

@@ -36,6 +36,72 @@ static User add(Store &s,int slot,const std::string &pin,int64_t uses=-1) {
     User u;u.slot=slot;u.name="User "+std::to_string(slot);u.remaining=uses;std::string err;
     CHECK(s.put(1,u,pin,0,err));return u;
 }
+static void apiPermissionTests() {
+    const char *path="alarm-api-permission-test.sqlite"; std::remove(path);
+    sqlite3 *db=nullptr; CHECK(sqlite3_open(path,&db)==SQLITE_OK);
+    // Exact pre-permission table layout: migration must work for already-managed alarms.
+    sql(db,"CREATE TABLE secrets(uniqueid TEXT PRIMARY KEY,secret TEXT,state INTEGER)");
+    sql(db,"CREATE TABLE alarm_user_management_v1(alarm INTEGER PRIMARY KEY)");
+    sql(db,"CREATE TABLE alarm_users_v1(alarm INTEGER NOT NULL,slot INTEGER NOT NULL,uid TEXT NOT NULL UNIQUE,name TEXT NOT NULL,hash TEXT NOT NULL,enabled INTEGER NOT NULL,remaining INTEGER NOT NULL,revision INTEGER NOT NULL,PRIMARY KEY(alarm,slot))");
+    const auto mainHash=hash("1357"),guestHash=hash("2468");
+    sql(db,"INSERT INTO secrets VALUES('as_1_code0','"+mainHash+"',1)");
+    sql(db,"INSERT INTO alarm_users_v1 VALUES(1,0,'main-one','Renamed main','"+mainHash+"',1,-1,7)");
+    sql(db,"INSERT INTO alarm_users_v1 VALUES(1,1,'guest-one','Guest','"+guestHash+"',1,3,4)");
+    sql(db,"INSERT INTO alarm_users_v1 VALUES(2,0,'main-two','Second main','"+mainHash+"',0,0,9)");
+    sql(db,"INSERT INTO alarm_user_management_v1 VALUES(1),(2)");
+    Store s(db,verify,hash);
+    auto main=get(s,0), guest=get(s,1); std::string err;
+    CHECK(main.apiArmDisarm && main.name=="Renamed main" && main.revision==7 && main.hash==mainHash);
+    CHECK(!guest.apiArmDisarm && guest.remaining==3 && guest.revision==4);
+    std::vector<User> second; CHECK(s.list(2,second));
+    CHECK(second.size()==1 && second[0].apiArmDisarm && !second[0].enabled && second[0].remaining==0);
+    CHECK(s.restCode(1,"1357") && !s.restCode(1,"2468") && !s.restCode(2,"1357"));
+    // Default-off API permission does not affect physical arming/disarming.
+    CHECK(s.authorize(1,"keypad",1,1,3,"2468",100000,false).response==3);
+    CHECK(s.authorize(1,"keypad",1,2,0,"2468",101000,true).response==6);
+    guest=get(s,1); CHECK(guest.remaining==2);
+    guest.apiArmDisarm=true; CHECK(s.put(1,guest,"",guest.revision,err));
+    const auto revision=guest.revision;
+    CHECK(s.restCode(1,"2468") && s.restCode(1,"1357")); // multiple API users
+    CHECK(!s.restCode(1,"9999") && !s.restCode(2,"2468")); // alarm-scoped
+    CHECK(get(s,1).remaining==2 && get(s,1).revision==revision); // REST does not consume
+    guest.name="Renamed guest"; CHECK(s.put(1,guest,"",guest.revision,err));
+    CHECK(guest.apiArmDisarm && guest.id=="guest-one" && s.restCode(1,"2468"));
+    main.apiArmDisarm=false; CHECK(s.put(1,main,"",main.revision,err));
+    CHECK(!s.restCode(1,"1357"));
+    CHECK(s.authorize(1,"keypad",1,3,0,"1357",102000,true).response==6);
+    CHECK(s.setMainCode(1,"1358")); CHECK(!s.restCode(1,"1358")); // no implicit regrant
+    CHECK(!get(s,0).apiArmDisarm);
+    CHECK(sqlite3_close(db)==SQLITE_OK); db=nullptr; CHECK(sqlite3_open(path,&db)==SQLITE_OK);
+    Store reopened(db,verify,hash);
+    CHECK(!get(reopened,0).apiArmDisarm && get(reopened,1).apiArmDisarm);
+    CHECK(!reopened.restCode(1,"1358") && reopened.restCode(1,"2468"));
+    guest=get(reopened,1); guest.enabled=false;
+    CHECK(reopened.put(1,guest,"",guest.revision,err)); CHECK(!reopened.restCode(1,"2468"));
+    guest.enabled=true; guest.remaining=0;
+    CHECK(reopened.put(1,guest,"",guest.revision,err)); CHECK(!reopened.restCode(1,"2468"));
+    guest.remaining=1; CHECK(reopened.put(1,guest,"2469",guest.revision,err));
+    CHECK(!reopened.restCode(1,"2468") && reopened.restCode(1,"2469"));
+    // Failed permission mutation must not change the PIN, policy, identity or revision.
+    const auto before=guest; guest.apiArmDisarm=false;
+    sql(db,"CREATE TRIGGER deny_policy BEFORE INSERT ON alarm_users_v1 BEGIN SELECT RAISE(ABORT,'fixture'); END");
+    CHECK(!reopened.put(1,guest,"",guest.revision,err));
+    CHECK(!reopened.restCode(1,"2469")); // storage failure denies authentication
+    sql(db,"DROP TRIGGER deny_policy");
+    CHECK(get(reopened,1).apiArmDisarm && get(reopened,1).revision==before.revision);
+    CHECK(reopened.restCode(1,"2469"));
+    guest=get(reopened,1); guest.apiArmDisarm=false;
+    CHECK(!reopened.put(1,guest,"",guest.revision-1,err) && err=="revision_conflict");
+    CHECK(get(reopened,1).apiArmDisarm);
+    CHECK(reopened.erase(1,1,guest.revision)); CHECK(!reopened.restCode(1,"2469"));
+    auto replacement=add(reopened,1,"2469");
+    CHECK(!replacement.apiArmDisarm && replacement.id!=before.id && !reopened.restCode(1,"2469"));
+    // A database policy read error must not silently authenticate via Main.
+    sql(db,"ALTER TABLE alarm_users_v1 RENAME COLUMN api_arm_disarm TO damaged_policy");
+    sql(db,"CREATE TRIGGER deny_migration BEFORE UPDATE ON alarm_users_v1 BEGIN SELECT RAISE(ABORT,'fixture'); END");
+    CHECK(!reopened.restCode(1,"1358"));
+    CHECK(sqlite3_close(db)==SQLITE_OK); std::remove(path);
+}
 int main() {
  try {
     const char *path="alarm-users-test.sqlite";std::remove(path);
@@ -64,7 +130,7 @@ int main() {
     CHECK(!store.put(1,failed,"0246",0,failure));
     CHECK(store.managementEnabled(1,managed) && !managed);CHECK(list(store).size()==1);
     sql(db,"DROP TRIGGER deny_optin");
-    CHECK(store.mainCode(1,"1357"));CHECK(!store.mainCode(1,"0000"));
+    CHECK(store.restCode(1,"1357"));CHECK(!store.restCode(1,"0000"));
     auto guest=add(store,1,"0246",5);const auto identity=guest.id;
     CHECK(store.managementEnabled(1,managed) && managed);
     CHECK(store.managementEnabled(2,managed) && !managed); // Independent opt-in per alarm.
@@ -93,7 +159,7 @@ int main() {
     guest.remaining=2;CHECK(reopened.put(1,guest,"",guest.revision,err));
     // ARM is allowed but does not consume; REST may only use the main credential.
     CHECK(reopened.authorize(1,"device",1,9,3,"0246",111000,false).response==3);
-    CHECK(get(reopened,1).remaining==2);CHECK(!reopened.mainCode(1,"0246"));
+    CHECK(get(reopened,1).remaining==2);CHECK(!reopened.restCode(1,"0246"));
     auto oldRevision=guest.revision;CHECK(!reopened.put(1,guest,"",oldRevision,err));CHECK(err=="revision_conflict");
     // Wrong PIN never decrements; disabled PIN cannot be reassigned elsewhere.
     CHECK(reopened.authorize(1,"device",1,10,0,"9999",112000,false).response==4);
@@ -125,13 +191,15 @@ int main() {
     CHECK(sqlite3_close(other)==SQLITE_OK);
     // Main PIN changes preserve restrictions and synchronize legacy hash.
     main=get(reopened,0);main.enabled=false;CHECK(reopened.put(1,main,"",main.revision,err));
-    CHECK(reopened.setMainCode(1,"1358"));CHECK(!reopened.mainCode(1,"1358"));CHECK(!get(reopened,0).enabled);
-    main=get(reopened,0);main.enabled=true;CHECK(reopened.put(1,main,"",main.revision,err));CHECK(reopened.mainCode(1,"1358"));
-    CHECK(reopened.erase(1,0,main.revision));CHECK(!reopened.mainCode(1,"1358"));CHECK(list(reopened).size()==8);
+    CHECK(reopened.setMainCode(1,"1358"));CHECK(!reopened.restCode(1,"1358"));CHECK(!get(reopened,0).enabled);
+    main=get(reopened,0);main.enabled=true;CHECK(reopened.put(1,main,"",main.revision,err));CHECK(reopened.restCode(1,"1358"));
+    CHECK(reopened.erase(1,0,main.revision));CHECK(!reopened.restCode(1,"1358"));CHECK(list(reopened).size()==8);
     // Deletion must not resurrect the legacy main credential on subsequent reads.
     CHECK(list(reopened).size()==8);
     CHECK(reopened.managementEnabled(1,managed) && managed); // Never silently fall back.
     CHECK(sqlite3_close(db)==SQLITE_OK);std::remove(path);
+    apiPermissionTests();
     std::cout<<"PASS: "<<assertions<<" checks (SQLite persistence, scrypt fixtures, concurrency, policy, retries)\n";
  } catch(const std::exception &e) {std::cerr<<e.what()<<"\n";return 1;}
 }
+

@@ -456,7 +456,7 @@ bool AlarmSystem::isValidCode(const QString &code, quint64 srcExtAddress)
 {
     bool managed = false;
     if (!userManagementEnabled(managed)) return false;
-    if (managed) return srcExtAddress == 0 && userStore().mainCode(id(), code.toStdString());
+    if (managed) return srcExtAddress == 0 && userStore().restCode(id(), code.toStdString());
     if (srcExtAddress != 0)
     {
         const AS_DeviceEntry &entry = d->devTable->get(srcExtAddress);
@@ -829,4 +829,5 @@ void AS_InitDefaultAlarmSystem(AlarmSystems &alarmSystems, AS_DeviceTable *devTa
 
     alarmSys->setValue(RAttrName, QString("default"));
 }
+
 
