@@ -118,6 +118,38 @@ int IAS_PanelStatusFromString(const QString &panelStatus)
     return -1;
 }
 
+static quint8 handleArmCommand(AlarmSystem *alarmSys, quint8 armMode, const QString &pinCode, quint64 srcAddress)
+{
+    if (!alarmSys || armMode > IAS_ACE_ARM_MODE_ARM_ALL_ZONES)
+    {
+        return IAS_ACE_ARM_NOTF_NOT_READY_TO_ARM;
+    }
+
+    if (!alarmSys->isValidCode(pinCode, srcAddress))
+    {
+        return IAS_ACE_ARM_NOTF_INVALID_ARM_DISARM_CODE;
+    }
+
+    const quint8 armMode0 = alarmSys->targetArmMode();
+
+    if (armMode0 == IAS_ACE_ARM_MODE_DISARM && armMode == armMode0)
+    {
+        return IAS_ACE_ARM_NOTF_ALREADY_DISARMED;
+    }
+
+    static_assert (IAS_ACE_ARM_MODE_DISARM == AS_ArmModeDisarmed, "");
+    static_assert (IAS_ACE_ARM_MODE_ARM_DAY_HOME_ZONES_ONLY == AS_ArmModeArmedStay, "");
+    static_assert (IAS_ACE_ARM_MODE_ARM_NIGHT_SLEEP_ZONES_ONLY == AS_ArmModeArmedNight, "");
+    static_assert (IAS_ACE_ARM_MODE_ARM_ALL_ZONES == AS_ArmModeArmedAway, "");
+
+    if (armMode0 != armMode)
+    {
+        alarmSys->setTargetArmMode(AS_ArmMode(armMode));
+    }
+
+    return armMode;
+}
+
 // User identity is an immutable event payload, not a mutable last-user attribute.
 static void publishAccess(const AlarmUsers::Result &result, const AlarmSystem *alarmSys,
                           const Sensor *sensor, int mode, qint64 timestamp)
@@ -173,18 +205,40 @@ void IAS_IasAceClusterIndication(const deCONZ::ApsDataIndication &ind, deCONZ::Z
         
         quint8 armRsp = IAS_ACE_ARM_NOTF_NOT_READY_TO_ARM;
 
-        // Strict Pascal-string parsing: require the trailing zone byte as well.
+        AlarmSystem *alarmSys = AS_GetAlarmSystemForDevice(ind.srcAddress().ext(), *alarmSystems);
+        bool managed = false;
+        if (alarmSys && !alarmSys->userManagementEnabled(managed))
+        {
+            sendArmResponse(ind, zclFrame, IAS_ACE_ARM_NOTF_NOT_READY_TO_ARM, apsCtrlWrapper);
+            return; // Never bypass an unreadable access policy.
+        }
         const auto &payload = zclFrame.payload();
         const int length = quint8(payload.at(1));
-        if (length > 16 || payload.size() != length + 3)
+        QString armCode;
+        if (managed)
         {
-            sendArmResponse(ind, zclFrame, IAS_ACE_ARM_NOTF_INVALID_ARM_DISARM_CODE, apsCtrlWrapper);
-            return; // malformed packets never become user actions
+            // Managed PINs require a complete, bounded IAS ACE payload.
+            if (length > 16 || payload.size() != length + 3)
+            {
+                sendArmResponse(ind, zclFrame, IAS_ACE_ARM_NOTF_INVALID_ARM_DISARM_CODE, apsCtrlWrapper);
+                return;
+            }
+            armCode = QString::fromUtf8(payload.constData() + 2, length);
         }
-        const QString armCode = QString::fromUtf8(payload.constData() + 2, length);
-        AlarmSystem *alarmSys = AS_GetAlarmSystemForDevice(ind.srcAddress().ext(), *alarmSystems);
+        else if (payload.size() > 2)
+        {
+            // Preserve legacy/keyfob payload handling for alarms that never opt in.
+            if (length <= payload.size() - 2)
+                armCode = QString::fromUtf8(payload.constData() + 2, length);
+            else
+                armCode = QLatin1String("invalid_code");
+        }
 
-        if (alarmSys)
+        if (alarmSys && !managed)
+        {
+            armRsp = handleArmCommand(alarmSys, armMode, armCode, ind.srcAddress().ext());
+        }
+        else if (alarmSys)
         {
             const qint64 timestamp = QDateTime::currentMSecsSinceEpoch();
             const auto access = alarmSys->authorizeKeypad(armCode, ind.srcAddress().ext(),

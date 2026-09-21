@@ -33,7 +33,7 @@ GUI = 'deconz-gui.service'
 UNITS = (CONTROLLER, HOMEBRIDGE, GATEWAY, GUI)
 FORMAT = 'garage-deconz-snapshot-v1'
 BASELINE = 'a4c17adfa04abc63637ad17de7f85256a825a2cb'
-FEATURE = '79551b7c129240988f55f1806ca05c660f53ab8d'
+FEATURE = 'pending-reviewed-opt-in-build'
 
 
 class Stop(Exception):
@@ -59,7 +59,18 @@ def unit(name):
 
 def control(action, name):
     # The commissioned controller intentionally waits for active operations to finish.
-    run('systemctl', action, name, timeout=200)
+    if name == HOMEBRIDGE:
+        require(action in ('stop', 'start'), 'unsupported_homebridge_action')
+        executable = shutil.which('hb-service')
+        require(executable is not None, 'hb_service_not_found')
+        run(executable, action, timeout=200)  # This helper already runs under sudo.
+        info = unit(HOMEBRIDGE)
+        require((info.get('ActiveState') == 'active' and info.get('SubState') == 'running')
+                if action == 'start' else
+                (info.get('ActiveState') in ('inactive', 'failed') and info.get('MainPID') == '0'),
+                'homebridge_service_transition_not_confirmed')
+    else:
+        run('systemctl', action, name, timeout=200)
 
 
 def digest(path):
@@ -292,6 +303,7 @@ class Maintenance:
         return result
 
     def check_units(self, active):
+        require(shutil.which('hb-service') is not None, 'hb_service_not_found')
         for name in UNITS:
             info = unit(name)
             require(info.get('LoadState') == 'loaded', 'missing_expected_unit')
@@ -436,7 +448,7 @@ class Maintenance:
                 'build_revision_requires_review')
         installed = run('dpkg-query', '-W', '-f=${Version}', 'deconz').strip()
         require(installed == versions.get('installed_deconz') == '2.33.2', 'installed_deconz_version_changed')
-        require('PASS: 128 checks' in (folder / 'tests.log').read_text(), 'passing_build_tests_required')
+        require('PASS: 150 checks' in (folder / 'tests.log').read_text(), 'passing_build_tests_required')
         hashes = {}
         for line in (folder / 'plugin-hashes.txt').read_text().splitlines():
             value, filename = line.split(maxsplit=1)

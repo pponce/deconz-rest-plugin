@@ -44,9 +44,30 @@ int main() {
     const auto original=hash("1357");
     sql(db,"INSERT INTO secrets VALUES('as_1_code0','"+original+"',1)");
     Store store(db,verify,hash);
+    bool managed=true;
+    Store unavailable(nullptr,verify,hash);CHECK(!unavailable.managementEnabled(1,managed));
+    CHECK(store.managementEnabled(1,managed) && !managed);
+    CHECK(!store.authorize(1,"device",1,1,0,"1357",100000,true).ok);
+    sqlite3_stmt *schema=nullptr;
+    CHECK(sqlite3_prepare_v2(db,"SELECT count(*) FROM sqlite_master WHERE name LIKE 'alarm_user%'",-1,&schema,nullptr)==SQLITE_OK);
+    CHECK(sqlite3_step(schema)==SQLITE_ROW && sqlite3_column_int(schema,0)==0);
+    sqlite3_finalize(schema); // Default checks neither migrate nor create access receipts.
     auto main=get(store,0);CHECK(main.hash==original);CHECK(main.enabled);CHECK(main.remaining==-1);
+    CHECK(store.managementEnabled(1,managed) && !managed); // GET/list is not opt-in.
+    const auto changed=hash("legacy-format-code");
+    sql(db,"UPDATE secrets SET secret='"+changed+"' WHERE uniqueid='as_1_code0'");
+    CHECK(get(store,0).hash==changed); // Legacy edits after GET stay authoritative.
+    sql(db,"UPDATE secrets SET secret='"+original+"' WHERE uniqueid='as_1_code0'");
+    // A failed explicit mutation must not activate management or retain its user.
+    sql(db,"CREATE TRIGGER deny_optin BEFORE INSERT ON alarm_user_management_v1 BEGIN SELECT RAISE(ABORT,'test'); END");
+    User failed;failed.slot=1;failed.name="Failed";std::string failure;
+    CHECK(!store.put(1,failed,"0246",0,failure));
+    CHECK(store.managementEnabled(1,managed) && !managed);CHECK(list(store).size()==1);
+    sql(db,"DROP TRIGGER deny_optin");
     CHECK(store.mainCode(1,"1357"));CHECK(!store.mainCode(1,"0000"));
     auto guest=add(store,1,"0246",5);const auto identity=guest.id;
+    CHECK(store.managementEnabled(1,managed) && managed);
+    CHECK(store.managementEnabled(2,managed) && !managed); // Independent opt-in per alarm.
     std::string err;
     auto dupe=guest;dupe.slot=2;CHECK(!store.put(1,dupe,"0246",0,err));CHECK(err=="pin_already_assigned");
     for(int i=0;i<5;i++) {
@@ -62,6 +83,7 @@ int main() {
     // Persisted receipt/counter survive close/reopen, including final-use retry.
     CHECK(sqlite3_close(db)==SQLITE_OK);db=nullptr;CHECK(sqlite3_open(path,&db)==SQLITE_OK);
     Store reopened(db,verify,hash);CHECK(get(reopened,1).remaining==0);
+    CHECK(reopened.managementEnabled(1,managed) && managed);
     CHECK(reopened.authorize(1,"device",1,4,0,"0246",108000,true).duplicate);
     guest=get(reopened,1);guest.enabled=false;guest.name="Alex";
     CHECK(reopened.put(1,guest,"",guest.revision,err));CHECK(guest.id==identity);
@@ -108,6 +130,7 @@ int main() {
     CHECK(reopened.erase(1,0,main.revision));CHECK(!reopened.mainCode(1,"1358"));CHECK(list(reopened).size()==8);
     // Deletion must not resurrect the legacy main credential on subsequent reads.
     CHECK(list(reopened).size()==8);
+    CHECK(reopened.managementEnabled(1,managed) && managed); // Never silently fall back.
     CHECK(sqlite3_close(db)==SQLITE_OK);std::remove(path);
     std::cout<<"PASS: "<<assertions<<" checks (SQLite persistence, scrypt fixtures, concurrency, policy, retries)\n";
  } catch(const std::exception &e) {std::cerr<<e.what()<<"\n";return 1;}

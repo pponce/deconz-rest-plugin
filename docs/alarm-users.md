@@ -5,9 +5,35 @@ This is an experimental deCONZ REST plugin change, not keypad firmware.
 Do not replace the household plugin until a full build and supervised commissioning
 have passed. Database-core tests are not a physical keypad or Homebridge test.
 
+## Optional adoption and reuse
+
+Existing alarm systems remain on the original single-code validation, code0
+configuration and IAS ACE event path by default. Installing the plugin does not
+activate managed users, usage limits, access events or new retry suppression.
+The default path does not create the new user tables. API error messages still
+redact PINs rather than echoing them back.
+
+A successful PUT or DELETE on the new `/alarmsystems/<id>/users/<slot>` endpoint
+opts that alarm system into managed users. Activation commits atomically with the
+requested user mutation. GET/list alone does not opt in; it may create preview
+rows, which continue reflecting legacy code0 edits until activation. Failed writes
+do not opt in. Each alarm system opts in independently. Once opted in, deleting
+users does not silently revert to legacy authentication or restore disabled PINs.
+An unreadable policy fails closed, never falls back around managed restrictions.
+
+The user store is alarm-scoped and independent of keypad manufacturer, Homebridge
+and garage movement. Its current protocol adapter is standard IAS ACE and uses
+the existing alarm-system/device association. The same alarm can share its code
+pool across associated keypads. There is no Xfinity model check in the access
+policy. Other IAS ACE devices remain compatibility candidates, not verified
+supported hardware; non-IAS devices require their own protocol adapter. Legacy
+keyfob/payload handling stays on the original path until the alarm opts in.
+The Xfinity DDF change is a separate device fix, not a requirement embedded in the
+user-store implementation. No garage close/open logic is added to deCONZ.
+
 ## Scope and policy
 
-Nine slots, 0–8, per alarm system. Slot 0 migrates the existing main PIN hash
+Nine slots, 0–8, per alarm system. On using the user API, slot 0 imports the existing main PIN hash
 unchanged and remains the only credential accepted by the legacy REST arm/disarm
 API used by Homebridge. The main user can be renamed, edited, disabled or deleted;
 disabling/deleting it intentionally disables Homebridge alarm commands until a
@@ -212,3 +238,12 @@ Owner reports baseline and feature 79551b7 built successfully on Linux with Qt
 library dependencies resolve on the host. Headless deCONZ and dependent services
 are running; the active database and custom devices directory were identified
 privately. No replacement plugin has been installed or runtime-tested yet.
+
+## Optional-adoption verification update
+
+The earlier staged implementation 79551b7 automatically routed alarms through
+managed storage. It is superseded by the explicit per-alarm adoption behavior
+above and must not be used for the requested compatibility-first commissioning.
+Rebuild the updated implementation before feature installation. Store checks now
+include default-off/no-schema behavior, GET without opt-in, legacy PIN edits after
+GET, failed activation rollback, per-alarm isolation and persistent activation.

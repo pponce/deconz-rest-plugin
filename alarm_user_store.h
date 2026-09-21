@@ -32,6 +32,8 @@ using Hash = std::function<std::string(const std::string &)>;
 class Store {
 public:
     Store(sqlite3 *db, Verify verify, Hash hash);
+    // Read-only opt-in check. Failure is not permission to fall back to legacy.
+    bool managementEnabled(int alarm, bool &enabled);
     bool list(int alarm, std::vector<User> &users);
     // expectedRevision=0 creates; >0 edits. Empty pin preserves existing hash.
     bool put(int alarm, User &user, const std::string &pin, int64_t expectedRevision,
@@ -47,6 +49,7 @@ private:
     Hash hash;
     bool init(int alarm);
     bool read(int alarm, std::vector<User> &users);
+    bool activate(int alarm);
 };
 }
 #endif

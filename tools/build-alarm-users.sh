@@ -5,7 +5,8 @@ umask 077
 repo_root=$(git rev-parse --show-toplevel)
 cd "$repo_root"
 baseline=a4c17adfa04abc63637ad17de7f85256a825a2cb
-feature=$(git rev-parse HEAD)
+[[ $# -le 1 ]] || { echo 'Usage: bash tools/build-alarm-users.sh [reviewed-feature-commit]'; exit 1; }
+feature=$(git rev-parse --verify --end-of-options "${1:-HEAD}^{commit}")
 for program in git cmake pkg-config g++ python3; do
     command -v "$program" >/dev/null || { echo "Missing build dependency: $program. See BUILDING.md."; exit 1; }
 done

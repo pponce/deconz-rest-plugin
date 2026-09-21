@@ -79,6 +79,7 @@ public:
     void didSetValue(ResourceItem *i) override;
     bool isValidCode(const QString &code, quint64 srcExtAddress);
     bool users(std::vector<AlarmUsers::User> &out);
+    bool userManagementEnabled(bool &enabled);
     bool putUser(AlarmUsers::User &user, const QString &pin, qint64 revision, std::string &error);
     bool deleteUser(int slot, qint64 revision);
     AlarmUsers::Result authorizeKeypad(const QString &code, quint64 source, int endpoint,
@@ -129,4 +130,3 @@ const AlarmSystem *AS_GetAlarmSystem(AlarmSystemId alarmSystemId, const AlarmSys
 AlarmSystem *AS_GetAlarmSystem(AlarmSystemId alarmSystemId, AlarmSystems &alarmSystems);
 
 #endif // ALARM_SYSTEM_H
-

@@ -39,10 +39,34 @@ bool mirror(sqlite3 *db, int alarm, const User &u) {
 }
 Store::Store(sqlite3 *d, Verify v, Hash h) : db(d), verify(std::move(v)), hash(std::move(h)) {}
 
+bool Store::managementEnabled(int alarm, bool &enabled) {
+    enabled = false;
+    if (!db || alarm < 1 || alarm > 255) return false;
+    Statement exists(db, "SELECT 1 FROM sqlite_master WHERE type='table' AND name='alarm_user_management_v1'");
+    if (!exists.valid()) return false;
+    const int rc = exists.step();
+    if (rc == SQLITE_DONE) return true; // Existing installations need no schema migration.
+    if (rc != SQLITE_ROW) return false;
+    Statement s(db, "SELECT 1 FROM alarm_user_management_v1 WHERE alarm=?");
+    if (!s.valid()) return false;
+    s.number(1, alarm);
+    const int found = s.step();
+    enabled = found == SQLITE_ROW;
+    return enabled || found == SQLITE_DONE;
+}
+
+bool Store::activate(int alarm) {
+    Statement s(db, "INSERT OR IGNORE INTO alarm_user_management_v1 VALUES(?)");
+    if (!s.valid()) return false;
+    s.number(1, alarm);
+    return s.step() == SQLITE_DONE;
+}
+
 bool Store::init(int alarm) {
     if (!db || alarm < 1 || alarm > 255) return false;
     // Additive schema. No changes to upstream table layout or user_version.
-    if (!exec(db, "CREATE TABLE IF NOT EXISTS alarm_users_v1 ("
+    if (!exec(db, "CREATE TABLE IF NOT EXISTS alarm_user_management_v1 (alarm INTEGER PRIMARY KEY)") ||
+        !exec(db, "CREATE TABLE IF NOT EXISTS alarm_users_v1 ("
         "alarm INTEGER NOT NULL, slot INTEGER NOT NULL CHECK(slot BETWEEN 0 AND 8),"
         "uid TEXT NOT NULL UNIQUE, name TEXT NOT NULL, hash TEXT NOT NULL,"
         "enabled INTEGER NOT NULL CHECK(enabled IN (0,1)),"
@@ -58,7 +82,24 @@ bool Store::init(int alarm) {
         "FROM secrets WHERE uniqueid=? AND length(secret)>0");
     if (!s.valid()) return false;
     s.number(1, alarm); s.text(2, legacyKey(alarm));
-    return s.step() == SQLITE_DONE;
+    if (s.step() != SQLITE_DONE) return false;
+    bool managed = false;
+    if (!managementEnabled(alarm, managed)) return false;
+    if (!managed) {
+        // GET /users does not opt in. Reflect subsequent legacy code0 edits until
+        // an explicit successful user mutation activates management atomically.
+        Statement refresh(db, "UPDATE alarm_users_v1 SET hash=(SELECT secret FROM secrets WHERE uniqueid=?),"
+            "enabled=1,remaining=-1,revision=revision+1 WHERE alarm=? AND slot=0 AND "
+            "EXISTS(SELECT 1 FROM secrets WHERE uniqueid=? AND (secret<>hash OR enabled<>1 OR remaining<>-1))");
+        if (!refresh.valid()) return false;
+        refresh.text(1, legacyKey(alarm)); refresh.number(2, alarm); refresh.text(3, legacyKey(alarm));
+        if (refresh.step() != SQLITE_DONE) return false;
+        Statement removed(db, "DELETE FROM alarm_users_v1 WHERE alarm=? AND slot=0 AND NOT EXISTS(SELECT 1 FROM secrets WHERE uniqueid=?)");
+        if (!removed.valid()) return false;
+        removed.number(1, alarm); removed.text(2, legacyKey(alarm));
+        if (removed.step() != SQLITE_DONE) return false;
+    }
+    return true;
 }
 bool Store::read(int alarm, std::vector<User> &users) {
     users.clear();
@@ -102,7 +143,7 @@ bool Store::put(int alarm, User &u, const std::string &pin, int64_t revision, st
     if (!s.valid()) return false;
     s.number(1,alarm); s.number(2,u.slot); s.number(3,alarm); s.number(4,u.slot);
     s.text(5,u.name); s.text(6,u.hash); s.number(7,u.enabled); s.number(8,u.remaining); s.number(9,revision+1);
-    if (s.step()!=SQLITE_DONE || !mirror(db,alarm,u) || !read(alarm,users) || !t.commit()) return false;
+    if (s.step()!=SQLITE_DONE || !mirror(db,alarm,u) || !activate(alarm) || !read(alarm,users) || !t.commit()) return false;
     u = *std::find_if(users.begin(),users.end(),[&](const User &x){return x.slot==u.slot;});
     error.clear(); return true;
 }
@@ -119,7 +160,7 @@ bool Store::erase(int alarm, int slot, int64_t revision) {
         if (!d.valid()) return false;
         d.text(1,legacyKey(alarm)); if (d.step()!=SQLITE_DONE) return false;
     }
-    return t.commit();
+    return activate(alarm) && t.commit();
 }
 bool Store::mainCode(int alarm, const std::string &pin) {
     std::vector<User> users;
@@ -138,6 +179,8 @@ bool Store::setMainCode(int alarm, const std::string &pin) {
 Result Store::authorize(int alarm,const std::string &source,int endpoint,int sequence,
                         int mode,const std::string &pin,int64_t now,bool alreadyDisarmed) {
     Result result;
+    bool managed = false;
+    if (!managementEnabled(alarm, managed) || !managed) return result;
     if (source.empty() || source.size()>32 || endpoint<1 || endpoint>240 || sequence<0 || sequence>255 ||
         mode<0 || mode>3 || now<=DuplicateWindowMs) return result;
     Transaction t(db); std::vector<User> users;

@@ -31,9 +31,14 @@ files stay inside the snapshot and are removed on success.
 
 The tool does not change Homebridge/controller settings, unit definitions, boot
 enablement, API keys, PINs, user allowances or the custom DDF. Starting deCONZ can
-perform its ordinary persistence and, for the feature build, user-table migration.
+perform its ordinary persistence and, after explicit use of the user API, user-table migration.
 Homebridge/controller settings are not separately backed up by this tool because
 they are not edited; existing private project recovery files remain in place.
+
+The helper itself runs with sudo, so its `hb-service stop/start` calls already
+have root privileges. It verifies homebridge.service actually stopped before
+stopping deCONZ, and verifies startup before dependency checks. It does not fall
+back to direct systemctl Homebridge control if hb-service is unavailable.
 
 ## Preconditions and safeguards
 
@@ -53,10 +58,10 @@ controls and the keypad during maintenance. Keep SSH connected; do not reboot.
 The helper uses the established order:
 
 1. Stop the controller and acquire its operation lock; recheck physical feedback.
-2. Stop Homebridge, then deCONZ; verify every service and gateway process stopped.
+2. Stop Homebridge with `hb-service stop`, then deCONZ; verify every service and gateway process stopped.
 3. Copy and verify the private snapshot before any plugin replacement.
 4. Start deCONZ, verify the same executable/account/database and loaded plugin.
-5. Start Homebridge; revalidate the DDF, gateway mapping and fresh door/bolt state.
+5. Start Homebridge with `hb-service start`; revalidate the DDF, gateway mapping and fresh door/bolt state.
 6. Ask for `STILL` after the owner checks Home accessories and closed/locked/
    disarmed physical state. Start the controller last and wait for all inputs ready.
 
@@ -84,10 +89,13 @@ that completed baseline receipt, the expected current baseline binary hash, and
 unchanged deCONZ executable/library. It takes a fresh pre-feature snapshot, then
 installs the feature plugin. It asks for `FEATURE`, then `STILL`.
 
-The helper accepts the already-built implementation 79551b7 and baseline a4c17ad
-on deCONZ 2.33.2. Documentation/maintenance-helper commits do not require rebuilding
+The helper pins the reviewed opt-in implementation and baseline a4c17ad
+on deCONZ 2.33.2. The earlier feature build 79551b7 is superseded and refused. Documentation/maintenance-helper commits do not require rebuilding
 those binaries. An updated feature implementation requires deliberate revision
 review, fresh builds and adjusted gates; there is no silent latest-build selection.
+Pass the reviewed feature SHA as the optional argument to
+`bash tools/build-alarm-users.sh <reviewed-feature-commit>` when the checkout also
+contains newer documentation or maintenance-only commits.
 
 ### First functional test: existing behavior on the new deCONZ plugin
 

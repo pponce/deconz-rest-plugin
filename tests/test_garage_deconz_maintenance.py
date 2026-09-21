@@ -148,7 +148,7 @@ class SnapshotTests(unittest.TestCase):
         folder = self.root / '.local-builds/test'
         folder.mkdir(parents=True)
         (folder / 'versions.txt').write_text(f'baseline={m.BASELINE}\nfeature={m.FEATURE}\ninstalled_deconz=2.33.2\n')
-        (folder / 'tests.log').write_text('PASS: 128 checks (fixtures)\n')
+        (folder / 'tests.log').write_text('PASS: 150 checks (fixtures)\n')
         lines = []
         for variant in ('baseline', 'feature'):
             file = folder / (variant + '-stage/share/deCONZ/plugins/libde_rest_plugin.so')
@@ -239,6 +239,26 @@ class SnapshotTests(unittest.TestCase):
 
 
 class FlowTests(unittest.TestCase):
+    def test_homebridge_uses_hb_service_stop_and_start(self):
+        for action, state in [('stop', {'ActiveState': 'inactive', 'MainPID': '0'}),
+                              ('start', {'ActiveState': 'active', 'SubState': 'running'})]:
+            with patch.object(m.shutil, 'which', return_value='/usr/bin/hb-service'), \
+                 patch.object(m, 'run') as command, patch.object(m, 'unit', return_value=state):
+                m.control(action, m.HOMEBRIDGE)
+                command.assert_called_once_with('/usr/bin/hb-service', action, timeout=200)
+
+    def test_homebridge_stop_must_actually_stop_owned_service(self):
+        with patch.object(m.shutil, 'which', return_value='/usr/bin/hb-service'), \
+             patch.object(m, 'run'), patch.object(m, 'unit', return_value={'ActiveState': 'active', 'MainPID': '9'}):
+            with self.assertRaises(m.Stop):
+                m.control('stop', m.HOMEBRIDGE)
+
+    def test_missing_hb_service_does_not_fall_back_to_systemctl(self):
+        with patch.object(m.shutil, 'which', return_value=None), patch.object(m, 'run') as command:
+            with self.assertRaises(m.Stop):
+                m.control('stop', m.HOMEBRIDGE)
+            command.assert_not_called()
+
     def test_stop_order_and_post_stop_physical_check(self):
         events = []
         job = m.Maintenance.__new__(m.Maintenance)
