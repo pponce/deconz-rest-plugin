@@ -7694,4 +7694,3 @@ bool DB_LoadLegacyLightValue(DB_LegacyItem *litem)
 
     return result;
 }
-

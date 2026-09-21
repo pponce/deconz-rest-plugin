@@ -152,11 +152,28 @@ original plugin AND matching pre-install database, preserve the custom DDF, then
 restart in the known maintenance order. Confirm no unexpected motion and existing
 readiness/status before resuming use. No fault-reset shortcut or command replay.
 
+## Build-only helper
+
+From a clean checkout of this feature branch, run `bash tools/build-alarm-users.sh`.
+It stages both the unchanged baseline and current feature commit, using one exact
+deconz-lib revision for both (only the dependency GIT_TAG is pinned in the
+temporary source worktrees). It runs core tests and records hashes/versions under
+ignored, owner-only `.local-builds/`. It does not install packages, replace the
+live plugin, access the gateway database, or restart services. Preserve this output
+for the separate installation review. Bash syntax is checked; this helper has not
+been run on the household host.
+
 ## Verification status
+
+Complete Qt5 plugin build and core tests passed in GitHub Actions run
+35622450737 for implementation commit b36e9f0. Local address/undefined-behavior
+sanitizers also passed all 128 checks with leak detection disabled because the
+execution environment cannot support LeakSanitizer. This is build/core evidence,
+not household commissioning.
 
 Standalone production store code: tested with SQLite and real scrypt fixtures,
 including migration, five uses, duplicate final use, restart, concurrent last-use
 requests, disabled/re-enabled users, PIN edits, deletion/recreation, nine-slot cap,
 stale revisions, and transaction rollback on failed receipt insertion.
-Full Qt plugin build, real IAS messages, Homebridge compatibility and household
-installation must be recorded separately; these are not established by store tests.
+Real IAS messages, Homebridge compatibility and household installation still
+require supervised verification; these are not established by build/store tests.
