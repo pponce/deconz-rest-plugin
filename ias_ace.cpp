@@ -6,6 +6,7 @@
 
 #include "ias_ace.h"
 #include "ias_zone.h"
+#include <QDateTime>
 
 //  Arm mode command
 //-------------------
@@ -117,36 +118,26 @@ int IAS_PanelStatusFromString(const QString &panelStatus)
     return -1;
 }
 
-static quint8 handleArmCommand(AlarmSystem *alarmSys, quint8 armMode, const QString &pinCode, quint64 srcAddress)
+// User identity is an immutable event payload, not a mutable last-user attribute.
+static void publishAccess(const AlarmUsers::Result &result, const AlarmSystem *alarmSys,
+                          const Sensor *sensor, int mode, qint64 timestamp)
 {
-    if (!alarmSys || armMode > IAS_ACE_ARM_MODE_ARM_ALL_ZONES)
-    {
-        return IAS_ACE_ARM_NOTF_NOT_READY_TO_ARM;
-    }
-
-    if (!alarmSys->isValidCode(pinCode, srcAddress))
-    {
-        return IAS_ACE_ARM_NOTF_INVALID_ARM_DISARM_CODE;
-    }
-
-    const quint8 armMode0 = alarmSys->targetArmMode();
-
-    if (armMode0 == IAS_ACE_ARM_MODE_DISARM && armMode == armMode0)
-    {
-        return IAS_ACE_ARM_NOTF_ALREADY_DISARMED;
-    }
-
-    static_assert (IAS_ACE_ARM_MODE_DISARM == AS_ArmModeDisarmed, "");
-    static_assert (IAS_ACE_ARM_MODE_ARM_DAY_HOME_ZONES_ONLY == AS_ArmModeArmedStay, "");
-    static_assert (IAS_ACE_ARM_MODE_ARM_NIGHT_SLEEP_ZONES_ONLY == AS_ArmModeArmedNight, "");
-    static_assert (IAS_ACE_ARM_MODE_ARM_ALL_ZONES == AS_ArmModeArmedAway, "");
-
-    if (armMode0 != armMode)
-    {
-        alarmSys->setTargetArmMode(AS_ArmMode(armMode));
-    }
-
-    return armMode;
+    if (!result.ok || result.duplicate || result.user.slot < 0 || !plugin->webSocketServer) return;
+    QVariantMap map;
+    map[QLatin1String("t")] = QLatin1String("event");
+    map[QLatin1String("e")] = QLatin1String("access");
+    map[QLatin1String("r")] = QLatin1String("alarmsystems");
+    map[QLatin1String("id")] = alarmSys->idString();
+    map[QLatin1String("event_id")] = QString::fromStdString(result.eventId);
+    map[QLatin1String("user_id")] = QString::fromStdString(result.user.id);
+    map[QLatin1String("user_slot")] = result.user.slot;
+    map[QLatin1String("sensor_id")] = sensor->id();
+    map[QLatin1String("action")] = QString(IAS_ArmResponse[result.response]);
+    map[QLatin1String("uses_consumed")] = mode == 0 && result.user.remaining >= 0 ? 1 : 0;
+    map[QLatin1String("remaining_uses")] = result.user.remaining < 0
+        ? QVariant() : QVariant(qlonglong(result.user.remaining));
+    map[QLatin1String("timestamp")] = QDateTime::fromMSecsSinceEpoch(timestamp, Qt::UTC).toString(Qt::ISODateWithMs);
+    plugin->webSocketServer->broadcastTextMessage(Json::serialize(map));
 }
 
 void IAS_IasAceClusterIndication(const deCONZ::ApsDataIndication &ind, deCONZ::ZclFrame &zclFrame, AlarmSystems *alarmSystems, ApsControllerWrapper &apsCtrlWrapper)
@@ -182,32 +173,35 @@ void IAS_IasAceClusterIndication(const deCONZ::ApsDataIndication &ind, deCONZ::Z
         
         quint8 armRsp = IAS_ACE_ARM_NOTF_NOT_READY_TO_ARM;
 
-        // [1] arm/disarm code in payload (pascal string, allowed to be empty, e.g. for keyfobs)
-        QString armCode;
-        if (zclFrame.payload().size() > 2)
+        // Strict Pascal-string parsing: require the trailing zone byte as well.
+        const auto &payload = zclFrame.payload();
+        const int length = quint8(payload.at(1));
+        if (length > 16 || payload.size() != length + 3)
         {
-            int length = zclFrame.payload().at(1);
-            if (length <= zclFrame.payload().size() - 2)
-            {
-                armCode = QString::fromUtf8(zclFrame.payload().constData() + 2, length);
-            }
-            else
-            {
-                armRsp = IAS_ACE_ARM_NOTF_INVALID_ARM_DISARM_CODE;
-                armCode = QLatin1String("invalid_code");
-            }
+            sendArmResponse(ind, zclFrame, IAS_ACE_ARM_NOTF_INVALID_ARM_DISARM_CODE, apsCtrlWrapper);
+            return; // malformed packets never become user actions
         }
-
-        // [2] zone id (uint8, ignore, we don't do anything with it)
-        // const quint8 zoneId = static_cast<quint8>(zclFrame.payload().at(zclFrame.payload().size() - 1));
-        
-        DBG_Printf(DBG_IAS, "[IAS ACE] 0x%016llX arm command received, arm mode: 0x%02X, code length: %d\n", ind.srcAddress().ext(), armMode, (int)armCode.size());
-
+        const QString armCode = QString::fromUtf8(payload.constData() + 2, length);
         AlarmSystem *alarmSys = AS_GetAlarmSystemForDevice(ind.srcAddress().ext(), *alarmSystems);
 
         if (alarmSys)
         {
-            armRsp = handleArmCommand(alarmSys, armMode, armCode, ind.srcAddress().ext());
+            const qint64 timestamp = QDateTime::currentMSecsSinceEpoch();
+            const auto access = alarmSys->authorizeKeypad(armCode, ind.srcAddress().ext(),
+                ind.srcEndpoint(), zclFrame.sequenceNumber(), armMode, timestamp);
+            armRsp = access.ok ? quint8(access.response) : IAS_ACE_ARM_NOTF_NOT_READY_TO_ARM;
+            if (access.duplicate)
+            {
+                // Acknowledge a radio retry without another count, alarm write,
+                // sensor timestamp, legacy action, or access event.
+                sendArmResponse(ind, zclFrame, armRsp, apsCtrlWrapper);
+                return;
+            }
+            if (access.ok && (armRsp <= 3 || armRsp == IAS_ACE_ARM_NOTF_ALREADY_DISARMED))
+            {
+                alarmSys->setTargetArmMode(AS_ArmMode(armMode));
+                publishAccess(access, alarmSys, sensor, armMode, timestamp);
+            }
         }
 
         {
@@ -370,3 +364,4 @@ static void sendGetPanelStatusResponse(const deCONZ::ApsDataIndication &ind, deC
         DBG_Printf(DBG_IAS, "[IAS ACE] 0x%016llX failed to send IAS ACE get panel reponse.\n", ind.srcAddress().ext());
     }
 }
+

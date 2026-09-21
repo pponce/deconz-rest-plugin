@@ -446,30 +446,54 @@ void AlarmSystem::didSetValue(ResourceItem *i)
     The verification is only done if an entry for \p srcExtAddress exists
     in the alarm system device table.
  */
+static AlarmUsers::Store userStore()
+{
+    return AlarmUsers::Store(DB_AlarmUserConnection(), CRYPTO_ScryptVerify,
+        [](const std::string &pin) { return CRYPTO_ScryptPassword(pin, CRYPTO_GenerateSalt()); });
+}
+
 bool AlarmSystem::isValidCode(const QString &code, quint64 srcExtAddress)
 {
-    if (srcExtAddress != 0)
-    {
-        const AS_DeviceEntry &entry = d->devTable->get(srcExtAddress);
+    // Legacy REST compatibility only. Physical requests must use authorizeKeypad
+    // to enforce counts and duplicate handling before changing alarm state.
+    return srcExtAddress == 0 && userStore().mainCode(id(), code.toStdString());
+}
 
-        if (!isValid(entry) || entry.alarmSystemId != id())
-        {
-            return false;
-        }
+bool AlarmSystem::users(std::vector<AlarmUsers::User> &out)
+{
+    return userStore().list(id(), out);
+}
+
+bool AlarmSystem::putUser(AlarmUsers::User &user, const QString &pin, qint64 revision, std::string &error)
+{
+    const bool ok = userStore().put(id(), user, pin.toStdString(), revision, error);
+    if (ok) setValue(RConfigConfigured, true);
+    return ok;
+}
+
+bool AlarmSystem::deleteUser(int slot, qint64 revision)
+{
+    const bool ok = userStore().erase(id(), slot, revision);
+    if (ok) {
+        std::vector<AlarmUsers::User> remaining;
+        if (users(remaining)) setValue(RConfigConfigured, !remaining.empty());
     }
+    return ok;
+}
 
-    DB_Secret sec;
-    sec.uniqueId = QString(AS_ID_CODE0).arg(id()).toStdString();
-
-    if (DB_LoadSecret(sec))
-    {
-        if (CRYPTO_ScryptVerify(sec.secret, code.toStdString()))
-        {
-            return true;
-        }
+AlarmUsers::Result AlarmSystem::authorizeKeypad(const QString &code, quint64 source,
+                                               int endpoint, int sequence, int mode, qint64 nowMs)
+{
+    const AS_DeviceEntry &entry = d->devTable->get(source);
+    if (!isValid(entry) || entry.alarmSystemId != id()) {
+        AlarmUsers::Result denied;
+        denied.ok = true;
+        denied.response = 4;
+        return denied;
     }
-
-    return false;
+    return userStore().authorize(id(), QString::number(source, 16).toStdString(), endpoint,
+                                sequence, mode, code.toStdString(), nowMs,
+                                targetArmMode() == AS_ArmModeDisarmed);
 }
 
 AlarmSystemId AlarmSystem::id() const
@@ -559,30 +583,9 @@ const AS_DeviceTable *AlarmSystem::deviceTable() const
  */
 bool AlarmSystem::setCode(int index, const QString &code)
 {
-    if (code.isEmpty())
-    {
-        return false;
-    }
-
-    const std::string code0 = code.toStdString();
-
-    DB_Secret sec;
-    sec.uniqueId = QString("as_%1_code%2").arg(id()).arg(index).toStdString();
-    sec.secret = CRYPTO_ScryptPassword(code0, CRYPTO_GenerateSalt());
-    sec.state = 1;
-
-    if (sec.secret.empty())
-    {
-        return false;
-    }
-
-    if (DB_StoreSecret(sec))
-    {
-        setValue(RConfigConfigured, true);
-        return true;
-    }
-
-    return false;
+    if (index != 0 || !userStore().setMainCode(id(), code.toStdString())) return false;
+    setValue(RConfigConfigured, true);
+    return true;
 }
 
 /*! Starts the alarm system operational mode.
@@ -599,10 +602,8 @@ void AlarmSystem::start()
     d->updateArmStateAndPanelStatus();
     d->updateTargetStateValues();
 
-    DB_Secret sec;
-    sec.uniqueId = QString(AS_ID_CODE0).arg(id()).toStdString();
-
-    bool configured = DB_LoadSecret(sec);
+    std::vector<AlarmUsers::User> configuredUsers;
+    bool configured = users(configuredUsers) && !configuredUsers.empty();
     item(RConfigConfigured)->setValue(configured);
 }
 
@@ -763,3 +764,4 @@ void AS_InitDefaultAlarmSystem(AlarmSystems &alarmSystems, AS_DeviceTable *devTa
 
     alarmSys->setValue(RAttrName, QString("default"));
 }
+

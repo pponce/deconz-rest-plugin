@@ -14,6 +14,7 @@
 #include <QObject>
 #include <vector>
 #include "resource.h"
+#include "alarm_user_store.h"
 
 /*! \class AlarmSystem
 
@@ -77,6 +78,11 @@ public:
     void handleEvent(const Event &event);
     void didSetValue(ResourceItem *i) override;
     bool isValidCode(const QString &code, quint64 srcExtAddress);
+    bool users(std::vector<AlarmUsers::User> &out);
+    bool putUser(AlarmUsers::User &user, const QString &pin, qint64 revision, std::string &error);
+    bool deleteUser(int slot, qint64 revision);
+    AlarmUsers::Result authorizeKeypad(const QString &code, quint64 source, int endpoint,
+                                      int sequence, int mode, qint64 nowMs);
     AlarmSystemId id() const;
     const QString &idString() const;
     quint8 iasAcePanelStatus() const;
@@ -123,3 +129,4 @@ const AlarmSystem *AS_GetAlarmSystem(AlarmSystemId alarmSystemId, const AlarmSys
 AlarmSystem *AS_GetAlarmSystem(AlarmSystemId alarmSystemId, AlarmSystems &alarmSystems);
 
 #endif // ALARM_SYSTEM_H
+

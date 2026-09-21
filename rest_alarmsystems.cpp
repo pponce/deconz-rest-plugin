@@ -11,6 +11,7 @@
 #include "alarm_system_device_table.h"
 #include "de_web_plugin_private.h"
 #include "rest_alarmsystems.h"
+#include <cmath>
 
 #define ALARMSYS_PREFIX "/alarmsystems"
 #define FMT_AS_ID "/alarmsystems/%1"
@@ -179,9 +180,106 @@ static QVariantMap alarmSystemToMap(const AlarmSystem *alarmSys)
     return result;
 }
 
+// Explicit endpoint: names/identities are not included in gateway full-state dumps.
+static QVariantMap userToMap(const AlarmUsers::User &u)
+{
+    QVariantMap map;
+    map[QLatin1String("id")] = QString::fromStdString(u.id);
+    map[QLatin1String("slot")] = u.slot;
+    map[QLatin1String("name")] = QString::fromStdString(u.name);
+    map[QLatin1String("enabled")] = u.enabled;
+    map[QLatin1String("remaining_uses")] = u.remaining < 0 ? QVariant() : QVariant(qlonglong(u.remaining));
+    map[QLatin1String("revision")] = qlonglong(u.revision);
+    return map; // never hash or PIN
+}
+
+static int handleAlarmUsers(const ApiRequest &req, ApiResponse &rsp, AlarmSystems &systems)
+{
+    const int alarm = alarmSystemIdToInteger(req.hdr.pathAt(3));
+    AlarmSystem *sys = AS_GetAlarmSystem(alarm, systems);
+    auto fail = [&](const char *reason, bool storage = false) {
+        rsp.httpStatus = storage ? HttpStatusServiceUnavailable : HttpStatusBadRequest;
+        rsp.list.append(errorToMap(ERR_INVALID_VALUE, QString("/alarmsystems/%1/users").arg(alarm), QLatin1String(reason)));
+        return REQ_READY_SEND;
+    };
+    if (!sys) return fail("alarm_not_found");
+    std::vector<AlarmUsers::User> users;
+    if (!sys->users(users)) return fail("storage_error", true);
+    if (req.hdr.pathComponentsCount() == 5 && req.hdr.httpMethod() == HttpGet) {
+        for (const auto &u : users) rsp.map[QString::number(u.slot)] = userToMap(u);
+        if (users.empty()) rsp.str = QLatin1String("{}");
+        rsp.httpStatus = HttpStatusOk;
+        return REQ_READY_SEND;
+    }
+    if (req.hdr.pathComponentsCount() != 6) return REQ_NOT_HANDLED;
+    const auto part = req.hdr.pathAt(5);
+    if (part.size() != 1 || part.data()[0] < '0' || part.data()[0] > '8') return fail("invalid_slot");
+    const int slot = part.data()[0] - '0';
+    auto found = std::find_if(users.begin(), users.end(), [slot](const AlarmUsers::User &u) { return u.slot == slot; });
+    if (req.hdr.httpMethod() == HttpGet) {
+        if (found == users.end()) return fail("user_not_found");
+        rsp.map = userToMap(*found); rsp.httpStatus = HttpStatusOk; return REQ_READY_SEND;
+    }
+    if (req.hdr.httpMethod() != HttpPut && req.hdr.httpMethod() != HttpDelete) return REQ_NOT_HANDLED;
+    bool ok = false;
+    const QVariant parsed = Json::parse(req.content, ok);
+    const QVariantMap body = parsed.toMap();
+    if (!ok || parsed.type() != QVariant::Map || body.isEmpty()) return fail("invalid_body");
+    // A mandatory revision prevents stale edits/reset requests from restoring uses.
+    const auto number = [](const QVariant &v, qint64 &out) {
+        if (v.type() != QVariant::Double && v.type() != QVariant::Int && v.type() != QVariant::LongLong && v.type() != QVariant::UInt) return false;
+        const double d = v.toDouble();
+        if (!std::isfinite(d) || d < 0 || d > 9007199254740991.0 || std::floor(d) != d) return false;
+        out = qint64(d); return true;
+    };
+    qint64 revision = 0;
+    if (!number(body.value(QLatin1String("revision")), revision)) return fail("revision_required");
+    if (req.hdr.httpMethod() == HttpDelete) {
+        if (body.size() != 1) return fail("unknown_field");
+        if (!sys->deleteUser(slot, revision)) return fail("delete_failed_or_revision_conflict");
+        rsp.httpStatus = HttpStatusOk;
+        rsp.map[QLatin1String("deleted")] = slot;
+        return REQ_READY_SEND;
+    }
+    const QStringList allowed = {"revision", "name", "pin", "enabled", "remaining_uses"};
+    for (auto i = body.cbegin(); i != body.cend(); ++i) if (!allowed.contains(i.key())) return fail("unknown_field");
+    AlarmUsers::User u;
+    if (found != users.end()) u = *found;
+    u.slot = slot;
+    QString pin;
+    if (body.contains(QLatin1String("pin"))) {
+        const QVariant value = body.value(QLatin1String("pin"));
+        if (value.type() != QVariant::String || value.toString().isEmpty()) return fail("invalid_pin");
+        pin = value.toString();
+    }
+    if (body.contains(QLatin1String("name"))) {
+        const QVariant value = body.value(QLatin1String("name"));
+        if (value.type() != QVariant::String) return fail("invalid_name");
+        u.name = value.toString().toStdString();
+    }
+    if (body.contains(QLatin1String("enabled"))) {
+        const QVariant value = body.value(QLatin1String("enabled"));
+        if (value.type() != QVariant::Bool) return fail("invalid_enabled");
+        u.enabled = value.toBool();
+    }
+    if (body.contains(QLatin1String("remaining_uses"))) {
+        const QVariant value = body.value(QLatin1String("remaining_uses"));
+        qint64 remaining = 0;
+        if (value.isNull()) u.remaining = -1;
+        else if (number(value, remaining) && remaining <= 1000000) u.remaining = remaining;
+        else return fail("invalid_remaining_uses");
+    }
+    std::string error;
+    if (!sys->putUser(u, pin, revision, error)) return fail(error.c_str(), error == "storage_error");
+    rsp.map = userToMap(u); rsp.httpStatus = HttpStatusOk;
+    return REQ_READY_SEND;
+}
+
 int AS_handleAlarmSystemsApi(const ApiRequest &req, ApiResponse &rsp, AlarmSystems &alarmSystems, EventEmitter *eventEmitter)
 {
     Q_UNUSED(eventEmitter);
+    if (req.hdr.pathComponentsCount() >= 5 && req.hdr.pathAt(4) == QLatin1String("users"))
+        return handleAlarmUsers(req, rsp, alarmSystems);
 
     // GET /api/<apikey>/alarmsystems
     if (req.hdr.pathComponentsCount() == 3 && req.hdr.httpMethod() == HttpGet)
@@ -335,7 +433,7 @@ static int putAlarmSystemConfig(const ApiRequest &req, ApiResponse &rsp, AlarmSy
 
             if (code0.size() < 4 || code0.size() > 16)
             {
-                rsp.list.append(errInvalidValue(id, "config/code0", code0));
+                rsp.list.append(errInvalidValue(id, "config/code0", QLatin1String("[redacted]")));
                 rsp.httpStatus = HttpStatusBadRequest;
                 return REQ_READY_SEND;
             }
@@ -483,7 +581,7 @@ static int putAlarmSystemArmMode(const ApiRequest &req, ApiResponse &rsp, AlarmS
 
     if (!alarmSys->isValidCode(code0, 0))
     {
-        rsp.list.append(errInvalidValue(id, "attr/code0", code0)); // use attr/ since this gets stripped away
+        rsp.list.append(errInvalidValue(id, "attr/code0", QLatin1String("[redacted]"))); // use attr/ since this gets stripped away
         rsp.httpStatus = HttpStatusBadRequest;
         return REQ_READY_SEND;
     }
@@ -745,3 +843,4 @@ static int deleteAlarmSystemDevice(const ApiRequest &req, ApiResponse &rsp, Alar
 
     return REQ_READY_SEND;
 }
+
