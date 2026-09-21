@@ -148,7 +148,7 @@ class SnapshotTests(unittest.TestCase):
         folder = self.root / '.local-builds/test'
         folder.mkdir(parents=True)
         (folder / 'versions.txt').write_text(f'baseline={m.BASELINE}\nfeature={m.FEATURE}\ninstalled_deconz=2.33.2\n')
-        (folder / 'tests.log').write_text('PASS: 150 checks (fixtures)\n')
+        (folder / 'tests.log').write_text('PASS: 223 checks (fixtures)\n')
         lines = []
         for variant in ('baseline', 'feature'):
             file = folder / (variant + '-stage/share/deCONZ/plugins/libde_rest_plugin.so')
@@ -321,5 +321,160 @@ class FlowTests(unittest.TestCase):
         job.restart.assert_not_called()
 
 
+class FeatureUpgradeTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.job = m.Maintenance.__new__(m.Maintenance)
+        self.job.root = self.root
+        self.plugin = self.root / 'plugin.so'
+        self.plugin.write_bytes(b'current feature')
+        self.job.system_identity = Mock(return_value={'executable': 'same'})
+        self.job.verify = Mock()
+        self.record = {'format': m.FORMAT, 'action': 'install-feature', 'complete': True,
+                       'installed_plugin_sha256': m.digest(self.plugin),
+                       'identity': {'executable': 'same'}}
+
+    def save(self, name, record=None):
+        path = self.root / name
+        path.mkdir()
+        (path / 'receipt.json').write_text(json.dumps(record or self.record))
+        return path
+
+    def test_matching_feature_receipt_selected_and_payload_verified(self):
+        path = self.save('20260101-install-feature')
+        self.assertEqual(self.job.upgrade_receipt(self.plugin), path.name)
+        self.job.verify.assert_called_once_with(path, self.record)
+
+    def test_most_recent_matching_receipt_but_not_unrelated_backup(self):
+        self.save('20260101-install-feature')
+        latest = self.save('20260102-upgrade-feature', dict(self.record, action='upgrade-feature'))
+        self.save('20260103-backup', dict(self.record, action='backup'))
+        self.assertEqual(self.job.upgrade_receipt(self.plugin), latest.name)
+
+    def test_invalid_receipts_cannot_authorize_upgrade(self):
+        for index, change in enumerate(({'complete': False}, {'resumed_without_installation': True},
+                 {'installed_plugin_sha256': 'different'}, {'identity': {}}, {'action': 'install-baseline'})):
+            name = 'invalid-' + str(index)
+            self.save(name, dict(self.record, **change))
+            with self.assertRaises(m.Stop):
+                self.job.upgrade_receipt(self.plugin, name)
+        with self.assertRaises(m.Stop):
+            self.job.upgrade_receipt(self.plugin)
+        self.job.verify.assert_not_called()
+
+    def test_corrupt_payload_refused(self):
+        self.save('feature')
+        self.job.verify.side_effect = m.Stop('corrupt')
+        with self.assertRaises(m.Stop):
+            self.job.upgrade_receipt(self.plugin)
+
+    def test_missing_receipt_stops_before_confirmation_or_services(self):
+        self.job.guard = SimpleNamespace(capture=Mock(), idle=Mock())
+        self.job.check_units = Mock()
+        self.job.plugin_path = Mock(return_value=self.plugin)
+        self.job.build = Mock(return_value={'feature': Path('/unused')})
+        with patch.object(m, 'confirm') as prompt, patch.object(m, 'control') as commands:
+            with self.assertRaises(m.Stop):
+                self.job.forward('upgrade-feature', Path('/unused'))
+            prompt.assert_not_called()
+            commands.assert_not_called()
+
+    def test_upgrade_snapshots_before_replacement(self):
+        self.save('feature')
+        self.job.guard = SimpleNamespace(capture=Mock(), idle=Mock())
+        self.job.check_units = Mock()
+        self.job.plugin_path = Mock(return_value=self.plugin)
+        self.job.build = Mock(return_value={'feature': self.root / 'staged.so'})
+        self.job.record = {}
+        calls = []
+        self.job.begin = Mock()
+        self.job.save = Mock()
+        self.job.stop = Mock(side_effect=lambda: calls.append('stop'))
+        self.job.snapshot = Mock(side_effect=lambda *_: calls.append('snapshot'))
+        self.job.replace_plugin = Mock(side_effect=lambda *_: calls.append('replace'))
+        self.job.restart = Mock(side_effect=lambda *_: calls.append('restart'))
+        with patch.object(m, 'confirm'):
+            self.job.forward('upgrade-feature', self.root)
+        self.assertEqual(calls, ['stop', 'snapshot', 'replace', 'restart'])
+        self.job.replace_plugin.assert_called_once_with(self.root / 'staged.so')
+        self.assertEqual(self.job.record['previous_feature_receipt'], 'feature')
+
+    def test_upgrade_snapshot_failure_never_replaces_or_restarts(self):
+        self.save('feature')
+        self.job.guard = SimpleNamespace(capture=Mock(), idle=Mock())
+        self.job.check_units = Mock()
+        self.job.plugin_path = Mock(return_value=self.plugin)
+        self.job.build = Mock(return_value={'feature': Path('/unused')})
+        self.job.record = {}
+        for name in ('begin', 'save', 'stop', 'replace_plugin', 'restart'):
+            setattr(self.job, name, Mock())
+        self.job.snapshot = Mock(side_effect=m.Stop('snapshot failed'))
+        with patch.object(m, 'confirm'):
+            with self.assertRaises(m.Stop):
+                self.job.forward('upgrade-feature', self.root)
+        self.job.replace_plugin.assert_not_called()
+        self.job.restart.assert_not_called()
+
+
+class UpgradeRunnerTests(unittest.TestCase):
+    def run_case(self, failed=None, build_only=False):
+        spec = importlib.util.spec_from_file_location('upgrade_runner',
+            Path(__file__).resolve().parents[1] / 'tools/upgrade-alarm-api.py')
+        runner = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(runner)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            commands = []
+            def fake_git(*args):
+                if args[:2] == ('rev-parse', '--show-toplevel'): return str(root)
+                if args[:2] == ('branch', '--show-current'): return 'alarm-users-v1'
+                if args[:2] == ('rev-parse', '--verify'): return runner.FEATURE
+                return ''
+            def run(command, **kwargs):
+                commands.append(command)
+                if command[0] == 'bash':
+                    folder = root / '.local-builds' / 'new-build'
+                    folder.mkdir()
+                    (folder / 'versions.txt').write_text('feature=' + runner.FEATURE)
+                    (folder / 'tests.log').write_text('PASS: 223 checks')
+                    return SimpleNamespace(returncode=1 if failed == 'build' else 0)
+                if command[0] == 'sudo':
+                    return SimpleNamespace(returncode=0)
+                return SimpleNamespace(returncode=1 if failed == 'tests' else 0)
+            with patch.object(runner, 'REPO', root), patch.object(runner, 'git', side_effect=fake_git), \
+                 patch.object(runner.os, 'geteuid', return_value=1000), \
+                 patch.object(runner.sys.stdin, 'isatty', return_value=True), \
+                 patch.object(runner.sys, 'argv', ['runner'] + (['--build-only'] if build_only else [])), \
+                 patch.object(runner.subprocess, 'run', side_effect=run):
+                code = runner.main()
+            return code, commands
+
+    def test_failed_tests_prevent_build_and_install(self):
+        code, commands = self.run_case(failed='tests')
+        self.assertEqual(code, 1)
+        self.assertFalse(any(c[0] in ('bash', 'sudo') for c in commands))
+
+    def test_failed_build_prevents_install(self):
+        code, commands = self.run_case(failed='build')
+        self.assertEqual(code, 1)
+        self.assertFalse(any(c[0] == 'sudo' for c in commands))
+
+    def test_build_only_never_invokes_sudo(self):
+        code, commands = self.run_case(build_only=True)
+        self.assertEqual(code, 0)
+        self.assertFalse(any(c[0] == 'sudo' for c in commands))
+
+    def test_success_invokes_supervised_upgrade_with_new_build(self):
+        code, commands = self.run_case()
+        self.assertEqual(code, 0)
+        install = [c for c in commands if c[0] == 'sudo']
+        self.assertEqual(len(install), 1)
+        self.assertIn('upgrade-feature', install[0])
+        self.assertEqual(Path(install[0][-1]).name, 'new-build')
+
+
 if __name__ == '__main__':
     unittest.main()
+

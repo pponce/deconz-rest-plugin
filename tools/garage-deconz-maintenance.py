@@ -33,7 +33,7 @@ GUI = 'deconz-gui.service'
 UNITS = (CONTROLLER, HOMEBRIDGE, GATEWAY, GUI)
 FORMAT = 'garage-deconz-snapshot-v1'
 BASELINE = 'a4c17adfa04abc63637ad17de7f85256a825a2cb'
-FEATURE = '039853eb786889aebc565cd5eece7b8978bb353f'
+FEATURE = '06b9c82264bbcfdf6cebf9583f8a7985f32a8683'
 
 
 class Stop(Exception):
@@ -448,7 +448,7 @@ class Maintenance:
                 'build_revision_requires_review')
         installed = run('dpkg-query', '-W', '-f=${Version}', 'deconz').strip()
         require(installed == versions.get('installed_deconz') == '2.33.2', 'installed_deconz_version_changed')
-        require('PASS: 150 checks' in (folder / 'tests.log').read_text(), 'passing_build_tests_required')
+        require('PASS: 223 checks' in (folder / 'tests.log').read_text(), 'passing_build_tests_required')
         hashes = {}
         for line in (folder / 'plugin-hashes.txt').read_text().splitlines():
             value, filename = line.split(maxsplit=1)
@@ -459,6 +459,35 @@ class Maintenance:
             require(hashes.get(str(path)) == digest(path), 'staged_plugin_hash_changed')
             result[variant] = path
         return result
+
+    def upgrade_receipt(self, plugin, name=None):
+        # Discovery is limited to completed local feature-install receipts whose
+        # installed hash and executable/library identity match the current host.
+        installed, identity = digest(plugin), self.system_identity()
+        def matches(record):
+            return (record.get('action') in ('install-feature', 'upgrade-feature') and
+                    record.get('complete') is True and
+                    not record.get('resumed_without_installation') and
+                    record.get('installed_plugin_sha256') == installed and
+                    record.get('identity') == identity)
+        if name:
+            path, record = self.load(name)
+            require(matches(record), 'verified_current_feature_required')
+        else:
+            candidates = []
+            for child in self.root.iterdir():
+                if child.is_symlink() or not child.is_dir() or not (child / 'receipt.json').is_file():
+                    continue
+                try:
+                    path, record = self.load(child.name)
+                except (Stop, OSError, ValueError):
+                    continue
+                if matches(record):
+                    candidates.append((path, record))
+            require(bool(candidates), 'verified_current_feature_required')
+            path, record = max(candidates, key=lambda pair: pair[0].name)
+        self.verify(path, record)
+        return path.name
 
     def forward(self, action, build=None, previous=None):
         self.check_units(True)
@@ -472,12 +501,16 @@ class Maintenance:
                     not receipt.get('resumed_without_installation') and
                     receipt.get('installed_plugin_sha256') == digest(plugin) == digest(stages['baseline']) and
                     receipt.get('identity') == self.system_identity(), 'verified_baseline_required')
-        word = {'backup': 'BACKUP', 'install-baseline': 'BASELINE', 'install-feature': 'FEATURE'}[action]
+        if action == 'upgrade-feature':
+            previous = self.upgrade_receipt(plugin, previous)
+        word = {'backup': 'BACKUP', 'install-baseline': 'BASELINE', 'install-feature': 'FEATURE', 'upgrade-feature': 'UPGRADE'}[action]
         print('Start CLOSED, LOCKED and DISARMED. Keep ALL controls unused until this tool finishes.', flush=True)
         confirm(word, 'Briefly stop controller, Homebridge and deCONZ; take a private snapshot' +
                 (' and replace only the plugin.' if stages else '; restart the unchanged system.'))
         self.guard.idle()
         self.begin(action)
+        if action == 'upgrade-feature':
+            self.record['previous_feature_receipt'] = previous
         self.record['plugin'] = str(plugin)
         self.record['original_plugin_sha256'] = digest(plugin)
         self.save('pre_stop')
@@ -520,7 +553,7 @@ class Maintenance:
 
     def resume_unchanged(self, name):
         self.tx, self.record = self.load(name)
-        require(self.record.get('action') in ('backup', 'install-baseline', 'install-feature') and
+        require(self.record.get('action') in ('backup', 'install-baseline', 'install-feature', 'upgrade-feature') and
                 not self.record.get('live_mutation_intent') and not self.record.get('complete'),
                 'resume_requires_no_live_file_changes')
         self.guard.saved = self.record['guard']
@@ -542,7 +575,7 @@ class Maintenance:
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action', choices=['backup', 'install-baseline', 'install-feature', 'rollback', 'resume-unchanged'])
+    parser.add_argument('action', choices=['backup', 'install-baseline', 'install-feature', 'upgrade-feature', 'rollback', 'resume-unchanged'])
     parser.add_argument('--build-dir', type=Path)
     parser.add_argument('--snapshot', help='snapshot directory name, never a path outside .local-backups')
     args = parser.parse_args()
@@ -591,3 +624,4 @@ def main():
 
 if __name__ == '__main__':
     sys.exit(main())
+

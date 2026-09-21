@@ -172,6 +172,50 @@ Run offline checks with:
 
 `python3 -B -m unittest discover -s tests -p 'test_garage_deconz_maintenance.py' -v`
 
-Reviewed optional-adoption feature build: `039853eb786889aebc565cd5eece7b8978bb353f`.
-Build it with `bash tools/build-alarm-users.sh 039853eb786889aebc565cd5eece7b8978bb353f`.
+Historical optional-adoption feature build (superseded for new installs): `039853eb786889aebc565cd5eece7b8978bb353f`.
+Retain its old build and recovery records; use the pinned upgrade below for new builds.
 This revision passes 150 access-policy checks and 23 offline maintenance checks.
+
+
+## Upgrade an already-installed feature plugin
+
+For the per-user API permission update, build runtime 06b9c82264bbcfdf6cebf9583f8a7985f32a8683 with
+`bash tools/build-alarm-users.sh 06b9c82264bbcfdf6cebf9583f8a7985f32a8683`. The installer
+requires this exact feature SHA and the successful 223-check result.
+
+Use `upgrade-feature --build-dir PATH`. This avoids reinstalling upstream or
+changing the database back to an earlier snapshot before the upgrade. It requires
+a completed local install-feature/upgrade-feature receipt matching the currently
+installed plugin hash and unchanged executable/library identity. By default it
+selects the most recent matching receipt and verifies its backup payload. You can
+provide `--snapshot NAME` to choose an exact qualifying receipt. Missing, corrupt,
+resumed-only or mismatched evidence stops before any service stop or mutation.
+
+After UPGRADE confirmation, the helper takes a NEW consistent private snapshot of
+the current plugin and gateway data, preserves the custom DDF and controller
+settings, replaces only the plugin and performs the established ordered restart
+and STILL check. Rollback uses this new upgrade snapshot and restores the old
+feature plugin together with its matching pre-upgrade database. Rollback also
+preserves the replaced state first. Do not use an older installation snapshot
+for this upgrade's rollback; it may restore the upstream binary instead.
+
+Run the existing-code compatibility cycle above after successful installation,
+with the doorway clear and physical bolt retraction observed. This is not proof
+of the cause or resolution of the earlier locked-bolt opening incident. Stop
+using controls and retain private evidence if behavior is unexpected. Do not
+clear a controller hold or repeat a failed movement automatically.
+
+This update does not mutate users, activate managed mode, change PINs, synchronize
+Homebridge credentials, enable schedules or install a web service. Those changes
+remain separate from compatibility acceptance.
+
+### Guided build and upgrade runner
+
+From a clean, updated alarm-users-v1 checkout, run
+`python3 -B tools/upgrade-alarm-api.py` as the normal login user. It checks the
+branch, pinned commit ancestry, ignored/untracked owner-only build/backup paths,
+and offline maintenance tests; builds both variants; selects only the new build
+created by that invocation with the pinned feature SHA; and invokes the sudo
+supervised upgrade. Raw compiler output remains in a private build log.
+`--build-only` stops before sudo or service maintenance. No credentials are needed
+in arguments, shell history or chat. On failure, share only the summary.
