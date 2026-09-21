@@ -171,3 +171,7 @@ restart and rollback are not verified until the owner runs the guided steps.
 Run offline checks with:
 
 `python3 -B -m unittest discover -s tests -p 'test_garage_deconz_maintenance.py' -v`
+
+Reviewed optional-adoption feature build: `039853eb786889aebc565cd5eece7b8978bb353f`.
+Build it with `bash tools/build-alarm-users.sh 039853eb786889aebc565cd5eece7b8978bb353f`.
+This revision passes 150 access-policy checks and 23 offline maintenance checks.

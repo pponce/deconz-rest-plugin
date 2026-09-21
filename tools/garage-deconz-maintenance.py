@@ -33,7 +33,7 @@ GUI = 'deconz-gui.service'
 UNITS = (CONTROLLER, HOMEBRIDGE, GATEWAY, GUI)
 FORMAT = 'garage-deconz-snapshot-v1'
 BASELINE = 'a4c17adfa04abc63637ad17de7f85256a825a2cb'
-FEATURE = 'pending-reviewed-opt-in-build'
+FEATURE = '039853eb786889aebc565cd5eece7b8978bb353f'
 
 
 class Stop(Exception):
