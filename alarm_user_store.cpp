@@ -138,6 +138,11 @@ bool Store::list(int alarm, std::vector<User> &users) {
     return t.active && init(alarm) && read(alarm, users) && t.commit();
 }
 bool Store::put(int alarm, User &u, const std::string &pin, int64_t revision, std::string &error) {
+    // Slot identity, not the editable display name, defines the primary user.
+    // Reject restrictions rather than silently correcting the submitted policy.
+    if (u.slot == 0 && (!u.enabled || !u.apiArmDisarm || u.remaining != -1 || !u.schedule.empty())) {
+        error = "primary_user_protected"; return false;
+    }
     error = "invalid_user";
     if (u.slot < 0 || u.slot >= MaxUsers || u.name.empty() || u.name.size() > 64 ||
         std::any_of(u.name.begin(), u.name.end(), [](unsigned char c) { return c < 32 || c == 127; }) ||
@@ -174,18 +179,13 @@ bool Store::put(int alarm, User &u, const std::string &pin, int64_t revision, st
     error.clear(); return true;
 }
 bool Store::erase(int alarm, int slot, int64_t revision) {
-    if (slot < 0 || slot >= MaxUsers || revision < 1) return false;
+    if (slot <= 0 || slot >= MaxUsers || revision < 1) return false;
     Transaction t(db);
     if (!t.active || !init(alarm)) return false;
     Statement s(db,"DELETE FROM alarm_users_v1 WHERE alarm=? AND slot=? AND revision=?");
     if (!s.valid()) return false;
     s.number(1,alarm); s.number(2,slot); s.number(3,revision);
     if (s.step()!=SQLITE_DONE || sqlite3_changes(db)!=1) return false;
-    if (slot == 0) {
-        Statement d(db,"DELETE FROM secrets WHERE uniqueid=?");
-        if (!d.valid()) return false;
-        d.text(1,legacyKey(alarm)); if (d.step()!=SQLITE_DONE) return false;
-    }
     if (!exec(db,"DELETE FROM alarm_user_schedules_v1 WHERE uid NOT IN (SELECT uid FROM alarm_users_v1)")) return false;
     return activate(alarm) && t.commit();
 }
@@ -200,12 +200,13 @@ bool Store::restCode(int alarm, const std::string &pin, int64_t now) {
     return false;
 }
 bool Store::setMainCode(int alarm, const std::string &pin) {
+    if (!validPin(pin)) return false;
     std::vector<User> users;
     if (!list(alarm,users)) return false;
     User u; u.slot=0; u.name="Main"; u.apiArmDisarm=true;
     for (const auto &x:users) if (x.slot==0) u=x;
     std::string error;
-    return put(alarm,u,pin,u.revision,error); // preserves disabled/exhausted status
+    return put(alarm,u,pin,u.revision,error); // restricted legacy records require explicit policy repair
 }
 Result Store::authorize(int alarm,const std::string &source,int endpoint,int sequence,
                         int mode,const std::string &pin,int64_t now,bool alreadyDisarmed) {
@@ -267,4 +268,3 @@ Result Store::authorize(int alarm,const std::string &source,int endpoint,int seq
     result.ok=t.commit(); return result;
 }
 }
-

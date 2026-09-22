@@ -33,8 +33,47 @@ static void sql(sqlite3 *db,const std::string &s) { CHECK(sqlite3_exec(db,s.c_st
 static std::vector<User> list(Store &s) { std::vector<User> u; CHECK(s.list(1,u));return u; }
 static User get(Store &s,int slot) { for(auto u:list(s))if(u.slot==slot)return u;throw std::runtime_error("missing"); }
 static User add(Store &s,int slot,const std::string &pin,int64_t uses=-1) {
-    User u;u.slot=slot;u.name="User "+std::to_string(slot);u.remaining=uses;std::string err;
+    User u;u.slot=slot;u.name="User "+std::to_string(slot);u.remaining=uses;u.apiArmDisarm=slot==0;std::string err;
     CHECK(s.put(1,u,pin,0,err));return u;
+}
+static void primaryProtectionTests() {
+    sqlite3 *db=nullptr; CHECK(sqlite3_open(":memory:",&db)==SQLITE_OK);
+    sql(db,"CREATE TABLE secrets(uniqueid TEXT PRIMARY KEY,secret TEXT,state INTEGER)");
+    Store store(db,verify,hash,[](const std::string &,int64_t){ return 1; });
+    auto primary=add(store,0,"1357");std::string err;
+    for (int restriction=0; restriction<5; ++restriction) {
+        auto changed=primary;
+        if (restriction==0) changed.enabled=false;
+        if (restriction==1) changed.apiArmDisarm=false;
+        if (restriction==2) changed.remaining=0;
+        if (restriction==3) changed.remaining=20;
+        if (restriction==4) changed.schedule="valid-policy";
+        CHECK(!store.put(1,changed,"9876",primary.revision,err));
+        CHECK(err=="primary_user_protected");
+        auto current=get(store,0);
+        CHECK(current.id==primary.id && current.hash==primary.hash && current.revision==primary.revision);
+        CHECK(current.enabled && current.apiArmDisarm && current.remaining==-1 && current.schedule.empty());
+        CHECK(store.restCode(1,"1357") && !store.restCode(1,"9876"));
+    }
+    CHECK(!store.erase(1,0,primary.revision));
+    primary.name="Renamed owner";CHECK(store.put(1,primary,"2468",primary.revision,err));
+    CHECK(store.restCode(1,"2468") && !store.restCode(1,"1357"));
+    for(int mode=0;mode<=3;++mode) {
+        auto result=store.authorize(1,"pad",1,mode,mode,"2468",100000+mode*1000,false);
+        CHECK(result.ok && result.response==mode && result.user.remaining==-1);
+    }
+    primary=get(store,0);
+    CHECK(!store.put(1,primary,"1234",primary.revision-1,err) && err=="revision_conflict");
+    CHECK(!store.setMainCode(1,"")); // Empty preserves an existing credential, never deletes it.
+    CHECK(store.restCode(1,"2468"));
+    // Previously restricted data must not be silently re-enabled by upgrading/reading.
+    sql(db,"UPDATE alarm_users_v1 SET enabled=0,remaining=0,api_arm_disarm=0 WHERE slot=0");
+    CHECK(!store.restCode(1,"2468"));CHECK(!store.setMainCode(1,"3579"));
+    auto restricted=get(store,0);CHECK(!restricted.enabled && restricted.remaining==0 && !restricted.apiArmDisarm);
+    restricted.enabled=true;restricted.remaining=-1;restricted.apiArmDisarm=true;restricted.schedule.clear();
+    CHECK(store.put(1,restricted,"3579",restricted.revision,err));
+    CHECK(store.restCode(1,"3579") && !store.restCode(1,"2468"));
+    CHECK(sqlite3_close(db)==SQLITE_OK);
 }
 static void schedulePolicyTests() {
     sqlite3 *db=nullptr; CHECK(sqlite3_open(":memory:",&db)==SQLITE_OK);
@@ -72,10 +111,11 @@ static void schedulePolicyTests() {
     sql(db,"DROP TRIGGER deny_schedule");
     user=get(store,1);CHECK(store.erase(1,1,user.revision));
     auto replacement=add(store,1,"2468");CHECK(replacement.schedule.empty());
-    // Slot 0 follows the same schedule restrictions, including after a legacy PIN update.
-    auto main=add(store,0,"1357");main.schedule="window";main.apiArmDisarm=true;CHECK(store.put(1,main,"",main.revision,err));
-    CHECK(!store.restCode(1,"1357",130000));CHECK(store.setMainCode(1,"1358"));
-    CHECK(get(store,0).schedule=="window" && !store.restCode(1,"1358",130000));
+    // Main can never acquire a schedule, including around a legacy PIN update.
+    auto main=add(store,0,"1357");main.schedule="window";
+    CHECK(!store.put(1,main,"",main.revision,err) && err=="primary_user_protected");
+    CHECK(store.restCode(1,"1357",130000));CHECK(store.setMainCode(1,"1358"));
+    CHECK(get(store,0).schedule.empty() && store.restCode(1,"1358",130000));
     CHECK(sqlite3_close(db)==SQLITE_OK);
 }
 static void apiPermissionTests() {
@@ -109,15 +149,15 @@ static void apiPermissionTests() {
     CHECK(get(s,1).remaining==2 && get(s,1).revision==revision); // REST does not consume
     guest.name="Renamed guest"; CHECK(s.put(1,guest,"",guest.revision,err));
     CHECK(guest.apiArmDisarm && guest.id=="guest-one" && s.restCode(1,"2468"));
-    main.apiArmDisarm=false; CHECK(s.put(1,main,"",main.revision,err));
-    CHECK(!s.restCode(1,"1357"));
+    main.apiArmDisarm=false; CHECK(!s.put(1,main,"",main.revision,err) && err=="primary_user_protected");
+    CHECK(s.restCode(1,"1357"));
     CHECK(s.authorize(1,"keypad",1,3,0,"1357",102000,true).response==6);
-    CHECK(s.setMainCode(1,"1358")); CHECK(!s.restCode(1,"1358")); // no implicit regrant
-    CHECK(!get(s,0).apiArmDisarm);
+    CHECK(s.setMainCode(1,"1358")); CHECK(s.restCode(1,"1358"));
+    CHECK(get(s,0).apiArmDisarm);
     CHECK(sqlite3_close(db)==SQLITE_OK); db=nullptr; CHECK(sqlite3_open(path,&db)==SQLITE_OK);
     Store reopened(db,verify,hash);
-    CHECK(!get(reopened,0).apiArmDisarm && get(reopened,1).apiArmDisarm);
-    CHECK(!reopened.restCode(1,"1358") && reopened.restCode(1,"2468"));
+    CHECK(get(reopened,0).apiArmDisarm && get(reopened,1).apiArmDisarm);
+    CHECK(reopened.restCode(1,"1358") && reopened.restCode(1,"2468"));
     guest=get(reopened,1); guest.enabled=false;
     CHECK(reopened.put(1,guest,"",guest.revision,err)); CHECK(!reopened.restCode(1,"2468"));
     guest.enabled=true; guest.remaining=0;
@@ -231,17 +271,20 @@ int main() {
     std::thread t2([&]{b=second.authorize(1,"device2",1,22,0,"2468",201000,true);});
     t1.join();t2.join();CHECK(a.ok && b.ok);CHECK((a.response==6)+(b.response==6)==1);CHECK(get(reopened,1).remaining==0);
     CHECK(sqlite3_close(other)==SQLITE_OK);
-    // Main PIN changes preserve restrictions and synchronize legacy hash.
-    main=get(reopened,0);main.enabled=false;CHECK(reopened.put(1,main,"",main.revision,err));
-    CHECK(reopened.setMainCode(1,"1358"));CHECK(!reopened.restCode(1,"1358"));CHECK(!get(reopened,0).enabled);
-    main=get(reopened,0);main.enabled=true;CHECK(reopened.put(1,main,"",main.revision,err));CHECK(reopened.restCode(1,"1358"));
-    CHECK(reopened.erase(1,0,main.revision));CHECK(!reopened.restCode(1,"1358"));CHECK(list(reopened).size()==8);
-    // Deletion must not resurrect the legacy main credential on subsequent reads.
-    CHECK(list(reopened).size()==8);
+    // Main restrictions/deletion are rejected; rotation still mirrors the legacy hash.
+    main=get(reopened,0);const auto mainBefore=main;main.enabled=false;
+    CHECK(!reopened.put(1,main,"",main.revision,err) && err=="primary_user_protected");
+    CHECK(get(reopened,0).revision==mainBefore.revision && get(reopened,0).hash==mainBefore.hash);
+    CHECK(reopened.setMainCode(1,"1358"));CHECK(reopened.restCode(1,"1358"));CHECK(get(reopened,0).enabled);
+    main=get(reopened,0);main.name="Owner";CHECK(reopened.put(1,main,"",main.revision,err));
+    CHECK(main.id==mainBefore.id && main.slot==0);
+    CHECK(!reopened.erase(1,0,main.revision));CHECK(reopened.restCode(1,"1358"));CHECK(list(reopened).size()==9);
+    CHECK(list(reopened).size()==9);
     CHECK(reopened.managementEnabled(1,managed) && managed); // Never silently fall back.
     CHECK(sqlite3_close(db)==SQLITE_OK);std::remove(path);
     apiPermissionTests();
     schedulePolicyTests();
+    primaryProtectionTests();
     std::cout<<"PASS: "<<assertions<<" checks (SQLite persistence, scrypt fixtures, concurrency, policy, retries)\n";
  } catch(const std::exception &e) {std::cerr<<e.what()<<"\n";return 1;}
 }

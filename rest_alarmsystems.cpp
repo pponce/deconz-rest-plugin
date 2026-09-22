@@ -213,6 +213,7 @@ static int handleAlarmUsers(const ApiRequest &req, ApiResponse &rsp, AlarmSystem
         rsp.map[QLatin1String("api_arm_disarm")] = true;
         rsp.map[QLatin1String("schedules")] = true;
         rsp.map[QLatin1String("schedule_version")] = 1;
+        rsp.map[QLatin1String("protected_primary_slot")] = 0;
         rsp.map[QLatin1String("max_users")] = AlarmUsers::MaxUsers;
         rsp.httpStatus = HttpStatusOk;
         return REQ_READY_SEND;
@@ -250,6 +251,7 @@ static int handleAlarmUsers(const ApiRequest &req, ApiResponse &rsp, AlarmSystem
     if (!number(body.value(QLatin1String("revision")), revision)) return fail("revision_required");
     if (req.hdr.httpMethod() == HttpDelete) {
         if (body.size() != 1) return fail("unknown_field");
+        if (slot == 0) return fail("primary_user_protected");
         if (!sys->deleteUser(slot, revision)) return fail("delete_failed_or_revision_conflict");
         rsp.httpStatus = HttpStatusOk;
         rsp.map[QLatin1String("deleted")] = slot;
