@@ -177,6 +177,32 @@ static void apiPermissionTests() {
     CHECK(!reopened.restCode(1,"1358"));
     CHECK(sqlite3_close(db)==SQLITE_OK); std::remove(path);
 }
+static void rejectedReceiptTests() {
+    sqlite3 *db=nullptr; CHECK(sqlite3_open(":memory:",&db)==SQLITE_OK);
+    sql(db,"CREATE TABLE secrets(uniqueid TEXT PRIMARY KEY,secret TEXT,state INTEGER)");
+    Store store(db,verify,hash);
+    bool managed=true; CHECK(store.managementEnabled(1,managed) && !managed);
+    auto legacy=store.authorize(1,"pad",1,1,0,"9999",100000,true);
+    CHECK(!legacy.ok && legacy.eventId.empty());
+    auto primary=add(store,0,"1357");
+    const auto before=get(store,0);
+    auto denied=store.authorize(1,"pad",1,1,0,"9999",100000,true);
+    CHECK(denied.ok && denied.response==4 && !denied.duplicate && !denied.eventId.empty());
+    CHECK(denied.user.slot==-1 && denied.user.id.empty());
+    auto retry=store.authorize(1,"pad",1,1,0,"9999",100001,true);
+    CHECK(retry.ok && retry.duplicate && retry.response==4 && retry.eventId==denied.eventId);
+    auto next=store.authorize(1,"pad",1,2,0,"9999",100002,true);
+    CHECK(next.ok && !next.duplicate && next.response==4 && next.eventId!=denied.eventId);
+    auto good=store.authorize(1,"pad",1,3,0,"1357",100003,true);
+    CHECK(good.ok && good.response==6 && good.eventId!=next.eventId);
+    CHECK(get(store,0).remaining==-1);
+    CHECK(get(store,0).revision==before.revision+1);
+    Store reopened(db,verify,hash);
+    auto persisted=reopened.authorize(1,"pad",1,2,0,"9999",100004,true);
+    CHECK(persisted.ok && persisted.duplicate && persisted.eventId==next.eventId);
+    CHECK(sqlite3_close(db)==SQLITE_OK);
+}
+
 int main() {
  try {
     const char *path="alarm-users-test.sqlite";std::remove(path);
@@ -278,6 +304,7 @@ int main() {
     apiPermissionTests();
     schedulePolicyTests();
     primaryProtectionTests();
+    rejectedReceiptTests();
     std::cout<<"PASS: "<<assertions<<" checks (SQLite persistence, scrypt fixtures, concurrency, policy, retries)\n";
  } catch(const std::exception &e) {std::cerr<<e.what()<<"\n";return 1;}
 }

@@ -11,6 +11,7 @@ on:
       - 'database*'
       - 'tests/alarm_users*'
       - 'tests/alarm_schedule*'
+      - 'tests/alarm_access_event*'
       - 'CMakeLists.txt'
       - '.github/workflows/alarm-users.yml'
   workflow_dispatch:
@@ -35,6 +36,10 @@ jobs:
         run: |
           g++ -std=c++14 -Wall -Wextra -Werror -fPIC -I. tests/alarm_schedule_test.cpp $(pkg-config --cflags --libs Qt5Core) -o /tmp/alarm_schedule_test
           /tmp/alarm_schedule_test
+      - name: Immutable access event tests
+        run: |
+          g++ -std=c++14 -Wall -Wextra -Werror -fPIC -I. tests/alarm_access_event_test.cpp $(pkg-config --cflags --libs Qt5Core) -o /tmp/alarm_access_event_test
+          /tmp/alarm_access_event_test
       - name: Build complete Qt5 plugin
         run: |
           cmake -S . -B build-alarm-users -G Ninja -DQT_VERSION_MAJOR=5 -DCMAKE_INSTALL_PREFIX=/usr

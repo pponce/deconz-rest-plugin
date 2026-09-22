@@ -214,6 +214,8 @@ static int handleAlarmUsers(const ApiRequest &req, ApiResponse &rsp, AlarmSystem
         rsp.map[QLatin1String("schedules")] = true;
         rsp.map[QLatin1String("schedule_version")] = 1;
         rsp.map[QLatin1String("protected_primary_slot")] = 0;
+        rsp.map[QLatin1String("access_event_version")] = 1;
+        rsp.map[QLatin1String("rejected_access_events")] = true;
         rsp.map[QLatin1String("max_users")] = AlarmUsers::MaxUsers;
         rsp.httpStatus = HttpStatusOk;
         return REQ_READY_SEND;

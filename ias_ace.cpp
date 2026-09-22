@@ -5,6 +5,7 @@
 #include "de_web_plugin_private.h"
 
 #include "ias_ace.h"
+#include "alarm_user_event.h"
 #include "ias_zone.h"
 #include <QDateTime>
 
@@ -151,25 +152,12 @@ static quint8 handleArmCommand(AlarmSystem *alarmSys, quint8 armMode, const QStr
 }
 
 // User identity is an immutable event payload, not a mutable last-user attribute.
-static void publishAccess(const AlarmUsers::Result &result, const AlarmSystem *alarmSys,
+static void publishAccess(bool managed, const AlarmUsers::Result &result, const AlarmSystem *alarmSys,
                           const Sensor *sensor, int mode, qint64 timestamp)
 {
-    if (!result.ok || result.duplicate || result.user.slot < 0 || !plugin->webSocketServer) return;
-    QVariantMap map;
-    map[QLatin1String("t")] = QLatin1String("event");
-    map[QLatin1String("e")] = QLatin1String("access");
-    map[QLatin1String("r")] = QLatin1String("alarmsystems");
-    map[QLatin1String("id")] = alarmSys->idString();
-    map[QLatin1String("event_id")] = QString::fromStdString(result.eventId);
-    map[QLatin1String("user_id")] = QString::fromStdString(result.user.id);
-    map[QLatin1String("user_slot")] = result.user.slot;
-    map[QLatin1String("sensor_id")] = sensor->id();
-    map[QLatin1String("action")] = QString(IAS_ArmResponse[result.response]);
-    map[QLatin1String("uses_consumed")] = mode == 0 && result.user.remaining >= 0 ? 1 : 0;
-    map[QLatin1String("remaining_uses")] = result.user.remaining < 0
-        ? QVariant() : QVariant(qlonglong(result.user.remaining));
-    map[QLatin1String("timestamp")] = QDateTime::fromMSecsSinceEpoch(timestamp, Qt::UTC).toString(Qt::ISODateWithMs);
-    plugin->webSocketServer->broadcastTextMessage(Json::serialize(map));
+    if (!plugin->webSocketServer) return;
+    const auto map = AlarmUsers::accessEvent(managed, result, alarmSys->idString(), sensor->id(), mode, timestamp);
+    if (!map.isEmpty()) plugin->webSocketServer->broadcastTextMessage(Json::serialize(map));
 }
 
 void IAS_IasAceClusterIndication(const deCONZ::ApsDataIndication &ind, deCONZ::ZclFrame &zclFrame, AlarmSystems *alarmSystems, ApsControllerWrapper &apsCtrlWrapper)
@@ -254,8 +242,9 @@ void IAS_IasAceClusterIndication(const deCONZ::ApsDataIndication &ind, deCONZ::Z
             if (access.ok && (armRsp <= 3 || armRsp == IAS_ACE_ARM_NOTF_ALREADY_DISARMED))
             {
                 alarmSys->setTargetArmMode(AS_ArmMode(armMode));
-                publishAccess(access, alarmSys, sensor, armMode, timestamp);
             }
+            // Includes rejected decisions; retries returned above, errors emit no decision.
+            publishAccess(managed, access, alarmSys, sensor, armMode, timestamp);
         }
 
         {
@@ -418,4 +407,3 @@ static void sendGetPanelStatusResponse(const deCONZ::ApsDataIndication &ind, deC
         DBG_Printf(DBG_IAS, "[IAS ACE] 0x%016llX failed to send IAS ACE get panel reponse.\n", ind.srcAddress().ext());
     }
 }
-
