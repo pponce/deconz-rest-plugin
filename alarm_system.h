@@ -78,6 +78,9 @@ public:
     void handleEvent(const Event &event);
     void didSetValue(ResourceItem *i) override;
     bool isValidCode(const QString &code, quint64 srcExtAddress);
+    bool lockout(AlarmUsers::LockoutPolicy &policy, std::vector<AlarmUsers::LockoutState> &states);
+    bool configureLockout(AlarmUsers::LockoutPolicy &policy, qint64 revision, std::string &error);
+    bool resetLockout();
     bool users(std::vector<AlarmUsers::User> &out);
     bool userManagementEnabled(bool &enabled);
     bool putUser(AlarmUsers::User &user, const QString &pin, qint64 revision, std::string &error);
@@ -130,3 +133,4 @@ const AlarmSystem *AS_GetAlarmSystem(AlarmSystemId alarmSystemId, const AlarmSys
 AlarmSystem *AS_GetAlarmSystem(AlarmSystemId alarmSystemId, AlarmSystems &alarmSystems);
 
 #endif // ALARM_SYSTEM_H
+

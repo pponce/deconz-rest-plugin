@@ -6,6 +6,7 @@
 #include <stdexcept>
 #include <thread>
 #include <atomic>
+#include <algorithm>
 #include <openssl/evp.h>
 #include <openssl/rand.h>
 #include <sstream>
@@ -35,6 +36,81 @@ static User get(Store &s,int slot) { for(auto u:list(s))if(u.slot==slot)return u
 static User add(Store &s,int slot,const std::string &pin,int64_t uses=-1) {
     User u;u.slot=slot;u.name="User "+std::to_string(slot);u.remaining=uses;u.apiArmDisarm=slot==0;std::string err;
     CHECK(s.put(1,u,pin,0,err));return u;
+}
+static void lockoutPersistenceTests() {
+    const char *path="/tmp/alarm-lockout-fixture.sqlite";std::remove(path);
+    sqlite3 *db=nullptr;CHECK(sqlite3_open(path,&db)==SQLITE_OK);
+    sql(db,"CREATE TABLE secrets(uniqueid TEXT PRIMARY KEY,secret TEXT,state INTEGER)");
+    Store s(db,verify,hash);add(s,0,"1357");LockoutPolicy p;p.enabled=true;p.threshold=1;std::string error;
+    CHECK(s.configureLockout(1,p,0,error));
+    CHECK(s.authorize(1,"pad",1,1,0,"9999",100000,false).locked);
+    CHECK(sqlite3_close(db)==SQLITE_OK);CHECK(sqlite3_open(path,&db)==SQLITE_OK);
+    Store reopened(db,verify,hash);
+    auto r=reopened.authorize(1,"pad",1,2,0,"1357",100001,false);
+    CHECK(r.ok&&r.locked&&r.lockedUntil==160000);
+    sql(db,"PRAGMA query_only=ON");
+    CHECK(!reopened.resetLockout(1));CHECK(!reopened.authorize(1,"pad",1,3,0,"1357",100002,false).ok);
+    sql(db,"PRAGMA query_only=OFF");
+    CHECK(reopened.resetLockout(1));CHECK(reopened.authorize(1,"pad",1,4,0,"1357",100003,false).response==0);
+    CHECK(sqlite3_close(db)==SQLITE_OK);std::remove(path);
+}
+static void lockoutTests() {
+    sqlite3 *db=nullptr;CHECK(sqlite3_open(":memory:",&db)==SQLITE_OK);
+    sql(db,"CREATE TABLE secrets(uniqueid TEXT PRIMARY KEY,secret TEXT,state INTEGER)");
+    Store s(db,verify,hash);LockoutPolicy p;std::vector<LockoutState> states;std::string error;
+    CHECK(s.lockout(1,p,states) && !p.enabled && states.empty());
+    bool managed=true;CHECK(s.managementEnabled(1,managed)&&!managed);
+    p.enabled=true;CHECK(!s.configureLockout(1,p,0,error)&&error=="managed_users_required");
+    add(s,0,"1357");add(s,1,"2468",5);
+    CHECK(s.lockout(1,p,states)&&!p.enabled);
+    for(int i=0;i<5;++i)CHECK(s.authorize(1,"pad",1,i,0,"9999",100000+i,false).response==4);
+    CHECK(s.authorize(1,"pad",1,6,0,"1357",100006,false).response==0);
+    p.enabled=true;p.durations[0]=60;p.durations[1]=1200;p.durations[2]=3600;
+    CHECK(s.configureLockout(1,p,0,error));
+    CHECK(!s.configureLockout(1,p,0,error)&&error=="revision_conflict");
+    auto invalid=p;invalid.durations[2]=3601;CHECK(!s.configureLockout(1,invalid,p.revision,error));
+    invalid=p;invalid.durations[1]=1;CHECK(!s.configureLockout(1,invalid,p.revision,error));
+    int seq=10;int64_t now=200000;
+    auto enter=[&](const char *pin) {return s.authorize(1,"pad",1,seq++%256,0,pin,now++,true);};
+    auto r=enter("9999");CHECK(r.ok&&!r.locked&&r.response==4);
+    auto dup=s.authorize(1,"pad",1,10,0,"9999",now,true);CHECK(dup.duplicate&&!dup.locked);
+    CHECK(!enter("9999").locked);r=enter("9999");CHECK(r.locked&&r.lockoutLevel==1&&r.lockedUntil==260002);
+    const auto until=r.lockedUntil;
+    for(int mode=0;mode<4;++mode) {
+        r=s.authorize(1,"pad",1,seq++,mode,"1357",now++,true);
+        CHECK(r.ok&&r.response==4&&r.locked&&r.lockedUntil==until&&r.user.slot==-1);
+    }
+    r=enter("2468");CHECK(r.locked&&get(s,1).remaining==5);
+    CHECK(s.restCode(1,"1357",now)); // Another authenticated route remains available.
+    CHECK(s.authorize(1,"other",1,1,0,"1357",now,true).response==6);
+    CHECK(s.authorize(1,"pad",2,1,0,"1357",now,true).response==6);
+    Store reopened(db,verify,hash);CHECK(reopened.lockout(1,p,states));
+    CHECK(reopened.authorize(1,"pad",1,seq++,0,"1357",now,true).locked);
+    for(int level=2;level<=4;++level) {
+        CHECK(s.lockout(1,p,states));
+        for(const auto &st:states)if(st.source=="pad"&&st.endpoint==1)now=st.until;
+        CHECK(!enter("9999").locked);CHECK(!enter("9999").locked);r=enter("9999");
+        CHECK(r.locked&&r.lockoutLevel==std::min(level,3));
+        CHECK(r.lockedUntil==now-1+int64_t(p.durations[std::min(level,3)-1])*1000);
+    }
+    CHECK(s.resetLockout(1));CHECK(enter("1357").response==6);
+    CHECK(s.lockout(1,p,states)&&p.enabled);
+    CHECK(!enter("9999").locked);now+=60001;CHECK(!enter("9999").locked);CHECK(!enter("9999").locked);
+    CHECK(enter("1357").response==6);CHECK(!enter("9999").locked); // success clears failures
+    auto guest=get(s,1);guest.enabled=false;CHECK(s.put(1,guest,"",guest.revision,error));
+    CHECK(enter("2468").response==4);CHECK(!enter("9999").locked);CHECK(!enter("9999").locked);
+    r=enter("9999");CHECK(r.locked&&r.lockoutLevel==1);
+    now+=int64_t(p.resetSeconds)*1000+1;
+    CHECK(!enter("9999").locked);CHECK(!enter("9999").locked);CHECK(enter("9999").lockoutLevel==1);
+    CHECK(s.configureLockout(1,p,p.revision,error)); // preserves active block
+    CHECK(enter("1357").locked);
+    p.enabled=false;CHECK(s.configureLockout(1,p,p.revision,error));CHECK(enter("1357").response==6);
+    CHECK(s.lockout(1,p,states)&&states.empty());
+    p.enabled=true;CHECK(s.configureLockout(1,p,p.revision,error));
+    CHECK(!enter("9999").locked);CHECK(!enter("9999").locked);CHECK(enter("9999").locked);
+    CHECK(!s.authorize(1,"pad",1,seq++,0,"1357",now-10000,true).ok); // backward clock fails closed
+    CHECK(s.resetLockout(1));CHECK(enter("1357").response==6);
+    CHECK(sqlite3_close(db)==SQLITE_OK);
 }
 static void primaryProtectionTests() {
     sqlite3 *db=nullptr; CHECK(sqlite3_open(":memory:",&db)==SQLITE_OK);
@@ -305,6 +381,8 @@ int main() {
     schedulePolicyTests();
     primaryProtectionTests();
     rejectedReceiptTests();
+    lockoutTests();
+    lockoutPersistenceTests();
     std::cout<<"PASS: "<<assertions<<" checks (SQLite persistence, scrypt fixtures, concurrency, policy, retries)\n";
  } catch(const std::exception &e) {std::cerr<<e.what()<<"\n";return 1;}
 }

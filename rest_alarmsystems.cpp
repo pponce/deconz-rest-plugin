@@ -13,6 +13,7 @@
 #include "de_web_plugin_private.h"
 #include "rest_alarmsystems.h"
 #include <cmath>
+#include <QDateTime>
 
 #define ALARMSYS_PREFIX "/alarmsystems"
 #define FMT_AS_ID "/alarmsystems/%1"
@@ -216,9 +217,56 @@ static int handleAlarmUsers(const ApiRequest &req, ApiResponse &rsp, AlarmSystem
         rsp.map[QLatin1String("protected_primary_slot")] = 0;
         rsp.map[QLatin1String("access_event_version")] = 1;
         rsp.map[QLatin1String("rejected_access_events")] = true;
+        rsp.map[QLatin1String("keypad_lockout_version")] = 1;
         rsp.map[QLatin1String("max_users")] = AlarmUsers::MaxUsers;
         rsp.httpStatus = HttpStatusOk;
         return REQ_READY_SEND;
+    }
+    // Authenticated users API; policy is independent of managed-user opt-in.
+    if (req.hdr.pathComponentsCount() == 6 && req.hdr.pathAt(5) == QLatin1String("lockout")) {
+        AlarmUsers::LockoutPolicy p; std::vector<AlarmUsers::LockoutState> states;
+        const auto integer = [](const QVariant &v,qint64 &out) {
+            if(v.type()!=QVariant::Double && v.type()!=QVariant::Int && v.type()!=QVariant::LongLong && v.type()!=QVariant::UInt)return false;
+            const double d=v.toDouble();
+            if(!std::isfinite(d)||d<0||d>9007199254740991.0||std::floor(d)!=d)return false;
+            out=qint64(d);return true;
+        };
+        if(req.hdr.httpMethod()==HttpPut || req.hdr.httpMethod()==HttpDelete) {
+            bool ok=false;const QVariant parsed=Json::parse(req.content,ok);const auto body=parsed.toMap();
+            if(!ok||parsed.type()!=QVariant::Map)return fail("invalid_body");
+            if(req.hdr.httpMethod()==HttpDelete) {
+                if(body.size()!=1||body.value(QLatin1String("reset")).type()!=QVariant::Bool||!body.value(QLatin1String("reset")).toBool())return fail("explicit_reset_required");
+                if(!sys->resetLockout())return fail("storage_error",true);
+            } else {
+                const QStringList keys={"enabled","threshold","window_seconds","durations_seconds","reset_seconds","revision"};
+                if(body.size()!=keys.size())return fail("invalid_lockout_policy");
+                for(auto i=body.cbegin();i!=body.cend();++i)if(!keys.contains(i.key()))return fail("unknown_field");
+                if(body.value("enabled").type()!=QVariant::Bool)return fail("invalid_lockout_policy");
+                p.enabled=body.value("enabled").toBool();
+                qint64 threshold,window,reset,revision;
+                if(!integer(body.value("threshold"),threshold)||threshold>100||!integer(body.value("window_seconds"),window)||window>3600||
+                   !integer(body.value("reset_seconds"),reset)||reset>604800||!integer(body.value("revision"),revision))return fail("invalid_lockout_policy");
+                p.threshold=int(threshold);p.windowSeconds=int(window);p.resetSeconds=int(reset);
+                if(body.value("durations_seconds").type()!=QVariant::List)return fail("invalid_lockout_policy");
+                const auto durations=body.value("durations_seconds").toList();
+                if(durations.size()!=3)return fail("invalid_lockout_policy");
+                for(int i=0;i<3;++i) {qint64 duration;if(!integer(durations[i],duration)||duration>3600)return fail("invalid_lockout_policy");p.durations[i]=int(duration);}
+                std::string error;
+                if(!sys->configureLockout(p,revision,error))return fail(error.c_str(),error=="storage_error");
+            }
+        } else if(req.hdr.httpMethod()!=HttpGet)return REQ_NOT_HANDLED;
+        if(!sys->lockout(p,states))return fail("storage_error",true);
+        QVariantMap policy;policy["enabled"]=p.enabled;policy["threshold"]=p.threshold;policy["window_seconds"]=p.windowSeconds;
+        policy["durations_seconds"]=QVariantList{p.durations[0],p.durations[1],p.durations[2]};
+        policy["reset_seconds"]=p.resetSeconds;policy["revision"]=qlonglong(p.revision);
+        rsp.map["policy"]=policy;QVariantList rows;const qint64 now=QDateTime::currentMSecsSinceEpoch();
+        for(const auto &st:states) {
+            QVariantMap row;row["source"]=QString::fromStdString(st.source);row["endpoint"]=st.endpoint;
+            row["level"]=st.level;row["locked_until"]=qlonglong(st.until);
+            row["remaining_seconds"]=qlonglong(p.enabled && st.until>now ? (st.until-now+999)/1000 : 0);
+            rows.append(row);
+        }
+        rsp.map["keypads"]=rows;rsp.httpStatus=HttpStatusOk;return REQ_READY_SEND;
     }
     std::vector<AlarmUsers::User> users;
     if (!sys->users(users)) return fail("storage_error", true);

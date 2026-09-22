@@ -60,6 +60,13 @@ int main()
         CHECK(event().isEmpty());
         result.response = 4;
         CHECK(!event().isEmpty());
+        result.locked=true;result.lockedUntil=1700000060000;result.lockoutLevel=2;
+        CHECK(event()["lockout"].toBool());
+        CHECK(event()["locked_until"].toLongLong()==1700000060000);
+        CHECK(event()["lockout_level"].toInt()==2);
+        CHECK(event()["action"]=="invalid_code");
+        CHECK(!event().contains("user_id"));
+        CHECK(event(false).isEmpty());
         result.eventId.clear();
         CHECK(event().isEmpty());
         std::cout << "PASS: " << checks << " access-event checks\n";

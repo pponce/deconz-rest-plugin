@@ -28,6 +28,11 @@ inline QVariantMap accessEvent(bool managed, const Result &result, const QString
     event[QLatin1String("action")] = QLatin1String(actions[result.response]);
     event[QLatin1String("timestamp")] = QDateTime::fromMSecsSinceEpoch(timestamp, Qt::UTC).toString(Qt::ISODateWithMs);
     event[QLatin1String("uses_consumed")] = !rejected && mode == 0 && result.user.remaining >= 0 ? 1 : 0;
+    if (result.locked) {
+        event[QLatin1String("lockout")] = true;
+        event[QLatin1String("locked_until")] = qlonglong(result.lockedUntil);
+        event[QLatin1String("lockout_level")] = result.lockoutLevel;
+    }
     if (!rejected)
     {
         event[QLatin1String("user_id")] = QString::fromStdString(result.user.id);

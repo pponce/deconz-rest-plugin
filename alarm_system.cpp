@@ -487,6 +487,13 @@ bool AlarmSystem::userManagementEnabled(bool &enabled)
     return userStore().managementEnabled(id(), enabled);
 }
 
+bool AlarmSystem::lockout(AlarmUsers::LockoutPolicy &p, std::vector<AlarmUsers::LockoutState> &states) {
+    return userStore().lockout(id(),p,states);
+}
+bool AlarmSystem::configureLockout(AlarmUsers::LockoutPolicy &p,qint64 revision,std::string &error) {
+    return userStore().configureLockout(id(),p,revision,error);
+}
+bool AlarmSystem::resetLockout() { return userStore().resetLockout(id()); }
 bool AlarmSystem::users(std::vector<AlarmUsers::User> &out)
 {
     return userStore().list(id(), out);
@@ -830,5 +837,6 @@ void AS_InitDefaultAlarmSystem(AlarmSystems &alarmSystems, AS_DeviceTable *devTa
 
     alarmSys->setValue(RAttrName, QString("default"));
 }
+
 
 

@@ -19,7 +19,22 @@ struct User {
     int64_t remaining = -1; // -1 unlimited; zero exhausted
     int64_t revision = 0;
 };
+struct LockoutPolicy {
+    bool enabled = false;
+    int threshold = 3, windowSeconds = 60;
+    int durations[3] = {60, 1200, 3600};
+    int resetSeconds = 86400;
+    int64_t revision = 0;
+};
+struct LockoutState {
+    std::string source;
+    int endpoint = 0, level = 0;
+    int64_t until = 0, lastFailure = 0;
+};
 struct Result {
+    bool locked = false;
+    int lockoutLevel = 0;
+    int64_t lockedUntil = 0;
     bool ok = false; // false = storage error, NEVER invalid code
     bool duplicate = false;
     int response = 5; // IAS not_ready
@@ -37,6 +52,9 @@ public:
     Store(sqlite3 *db, Verify verify, Hash hash, ScheduleCheck check = {});
     // Read-only opt-in check. Failure is not permission to fall back to legacy.
     bool managementEnabled(int alarm, bool &enabled);
+    bool lockout(int alarm, LockoutPolicy &policy, std::vector<LockoutState> &states);
+    bool configureLockout(int alarm, LockoutPolicy &policy, int64_t revision, std::string &error);
+    bool resetLockout(int alarm);
     bool list(int alarm, std::vector<User> &users);
     // expectedRevision=0 creates; >0 edits. Empty pin preserves existing hash.
     // Slot 0 must be enabled, unlimited, API-enabled and unscheduled.

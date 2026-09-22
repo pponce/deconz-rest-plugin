@@ -80,6 +80,9 @@ bool Store::init(int alarm) {
         "uid TEXT NOT NULL,response INTEGER NOT NULL,eventid TEXT NOT NULL,"
         "PRIMARY KEY(alarm,source,endpoint,sequence))")) return false;
     if (!exec(db, "CREATE TABLE IF NOT EXISTS alarm_user_schedules_v1 (uid TEXT PRIMARY KEY, policy TEXT NOT NULL)")) return false;
+    if (!exec(db, "CREATE TABLE IF NOT EXISTS alarm_lockout_policy_v1 (alarm INTEGER PRIMARY KEY,enabled INTEGER NOT NULL,threshold INTEGER NOT NULL,window INTEGER NOT NULL,d1 INTEGER NOT NULL,d2 INTEGER NOT NULL,d3 INTEGER NOT NULL,reset INTEGER NOT NULL,revision INTEGER NOT NULL)") ||
+        !exec(db, "CREATE TABLE IF NOT EXISTS alarm_lockout_state_v1 (alarm INTEGER NOT NULL,source TEXT NOT NULL,endpoint INTEGER NOT NULL,level INTEGER NOT NULL,until INTEGER NOT NULL,last_failure INTEGER NOT NULL,PRIMARY KEY(alarm,source,endpoint))") ||
+        !exec(db, "CREATE TABLE IF NOT EXISTS alarm_lockout_failures_v1 (alarm INTEGER NOT NULL,source TEXT NOT NULL,endpoint INTEGER NOT NULL,created INTEGER NOT NULL)")) return false;
     bool permissionColumn = false;
     {
         Statement columns(db, "PRAGMA table_info(alarm_users_v1)");
@@ -208,6 +211,74 @@ bool Store::setMainCode(int alarm, const std::string &pin) {
     std::string error;
     return put(alarm,u,pin,u.revision,error); // uses the same protected-primary validation as the users API
 }
+namespace {
+bool validPolicy(const LockoutPolicy &p) {
+    return p.threshold >= 1 && p.threshold <= 100 && p.windowSeconds >= 1 && p.windowSeconds <= 3600 &&
+        p.durations[0] >= 1 && p.durations[0] <= p.durations[1] && p.durations[1] <= p.durations[2] &&
+        p.durations[2] <= 3600 && p.resetSeconds >= 3600 && p.resetSeconds <= 604800 && p.revision >= 0;
+}
+bool readPolicy(sqlite3 *db, int alarm, LockoutPolicy &p) {
+    p = LockoutPolicy{};
+    Statement q(db,"SELECT enabled,threshold,window,d1,d2,d3,reset,revision FROM alarm_lockout_policy_v1 WHERE alarm=?");
+    if (!q.valid()) return false;
+    q.number(1,alarm); const int rc=q.step();
+    if (rc==SQLITE_DONE) return true;
+    if (rc!=SQLITE_ROW || (q.number(0)!=0 && q.number(0)!=1)) return false;
+    p.enabled=q.number(0)==1; p.threshold=int(q.number(1)); p.windowSeconds=int(q.number(2));
+    for(int i=0;i<3;++i) p.durations[i]=int(q.number(3+i));
+    p.resetSeconds=int(q.number(6)); p.revision=q.number(7);
+    return validPolicy(p);
+}
+bool clearFailures(sqlite3 *db,int alarm,const std::string &source,int endpoint) {
+    Statement q(db,"DELETE FROM alarm_lockout_failures_v1 WHERE alarm=? AND source=? AND endpoint=?");
+    if (!q.valid()) return false;
+    q.number(1,alarm);q.text(2,source);q.number(3,endpoint);return q.step()==SQLITE_DONE;
+}
+}
+bool Store::lockout(int alarm, LockoutPolicy &p, std::vector<LockoutState> &states) {
+    Transaction t(db); states.clear();
+    if (!t.active || !init(alarm) || !readPolicy(db,alarm,p)) return false;
+    Statement q(db,"SELECT source,endpoint,level,until,last_failure FROM alarm_lockout_state_v1 WHERE alarm=?");
+    if (!q.valid()) return false;
+    q.number(1,alarm);int rc;
+    while((rc=q.step())==SQLITE_ROW) {
+        LockoutState st;st.source=q.text(0);st.endpoint=int(q.number(1));st.level=int(q.number(2));
+        st.until=q.number(3);st.lastFailure=q.number(4);states.push_back(st);
+    }
+    return rc==SQLITE_DONE && t.commit();
+}
+bool Store::configureLockout(int alarm, LockoutPolicy &p, int64_t revision, std::string &error) {
+    error="invalid_lockout_policy";
+    if (!validPolicy(p) || revision<0) return false;
+    error="storage_error";Transaction t(db);LockoutPolicy old;bool managed=false;
+    if (!t.active || !init(alarm) || !managementEnabled(alarm,managed) || !readPolicy(db,alarm,old)) return false;
+    if (!managed && p.enabled) {error="managed_users_required";return false;}
+    if (old.revision!=revision) {error="revision_conflict";return false;}
+    Statement q(db,"INSERT OR REPLACE INTO alarm_lockout_policy_v1 VALUES(?,?,?,?,?,?,?,?,?)");
+    if (!q.valid()) return false;
+    q.number(1,alarm);q.number(2,p.enabled);q.number(3,p.threshold);q.number(4,p.windowSeconds);
+    for(int i=0;i<3;++i)q.number(5+i,p.durations[i]);
+    q.number(8,p.resetSeconds);q.number(9,revision+1);
+    if(q.step()!=SQLITE_DONE) return false;
+    // Disabling is explicit recovery. Editing enabled policy preserves active deadlines.
+    if (!p.enabled) {
+        Statement a(db,"DELETE FROM alarm_lockout_state_v1 WHERE alarm=?");
+        Statement b(db,"DELETE FROM alarm_lockout_failures_v1 WHERE alarm=?");
+        if(!a.valid()||!b.valid())return false;
+        a.number(1,alarm);b.number(1,alarm);
+        if(a.step()!=SQLITE_DONE||b.step()!=SQLITE_DONE)return false;
+    }
+    if(!t.commit())return false;
+    p.revision=revision+1;error.clear();return true;
+}
+bool Store::resetLockout(int alarm) {
+    Transaction t(db);if(!t.active||!init(alarm))return false;
+    Statement a(db,"DELETE FROM alarm_lockout_state_v1 WHERE alarm=?");
+    Statement b(db,"DELETE FROM alarm_lockout_failures_v1 WHERE alarm=?");
+    if(!a.valid()||!b.valid())return false;
+    a.number(1,alarm);b.number(1,alarm);
+    return a.step()==SQLITE_DONE && b.step()==SQLITE_DONE && t.commit();
+}
 Result Store::authorize(int alarm,const std::string &source,int endpoint,int sequence,
                         int mode,const std::string &pin,int64_t now,bool alreadyDisarmed) {
     Result result;
@@ -236,12 +307,52 @@ Result Store::authorize(int alarm,const std::string &source,int endpoint,int seq
     } else if (rc!=SQLITE_DONE) return result;
     previous.step(); // finish read before writes/commit
     result.response=4;
+    LockoutPolicy policy;
+    if (!readPolicy(db,alarm,policy)) return result;
+    LockoutState state;state.source=source;state.endpoint=endpoint;
+    if (policy.enabled) {
+        Statement q(db,"SELECT level,until,last_failure FROM alarm_lockout_state_v1 WHERE alarm=? AND source=? AND endpoint=?");
+        if(!q.valid())return Result{};
+        q.number(1,alarm);q.text(2,source);q.number(3,endpoint);const int found=q.step();
+        if(found==SQLITE_ROW) {
+            state.level=int(q.number(0));state.until=q.number(1);state.lastFailure=q.number(2);
+            if(state.level<0||state.level>3||state.until<0||state.lastFailure>now)return Result{};
+        } else if(found!=SQLITE_DONE)return Result{};
+        if(state.until>now) {
+            result.locked=true; // No timer extension, hashing outcome or usage mutation.
+        } else {
+            if(now-state.lastFailure>=int64_t(policy.resetSeconds)*1000)state.level=0;
+            if(matched.slot<0) {
+                Statement prune(db,"DELETE FROM alarm_lockout_failures_v1 WHERE alarm=? AND source=? AND endpoint=? AND created<=?");
+                Statement add(db,"INSERT INTO alarm_lockout_failures_v1 VALUES(?,?,?,?)");
+                Statement count(db,"SELECT count(*) FROM alarm_lockout_failures_v1 WHERE alarm=? AND source=? AND endpoint=?");
+                if(!prune.valid()||!add.valid()||!count.valid())return Result{};
+                for(auto q2:{&prune,&add,&count}) {q2->number(1,alarm);q2->text(2,source);q2->number(3,endpoint);}
+                prune.number(4,now-int64_t(policy.windowSeconds)*1000);add.number(4,now);
+                if(prune.step()!=SQLITE_DONE||add.step()!=SQLITE_DONE||count.step()!=SQLITE_ROW)return Result{};
+                const int failures=int(count.number(0));count.step();
+                state.lastFailure=now;
+                if(failures>=policy.threshold) {
+                    state.level=std::min(3,state.level+1);
+                    state.until=now+int64_t(policy.durations[state.level-1])*1000;
+                    result.locked=true;
+                    if(!clearFailures(db,alarm,source,endpoint))return Result{};
+                }
+            } else if(!clearFailures(db,alarm,source,endpoint))return Result{};
+            Statement saveState(db,"INSERT OR REPLACE INTO alarm_lockout_state_v1 VALUES(?,?,?,?,?,?)");
+            if(!saveState.valid())return Result{};
+            saveState.number(1,alarm);saveState.text(2,source);saveState.number(3,endpoint);
+            saveState.number(4,state.level);saveState.number(5,state.until);saveState.number(6,state.lastFailure);
+            if(saveState.step()!=SQLITE_DONE)return Result{};
+        }
+        if(result.locked){result.lockedUntil=state.until;result.lockoutLevel=state.level;}
+    }
     int scheduled = 1;
-    if (matched.slot >= 0 && !matched.schedule.empty()) {
+    if (!result.locked && matched.slot >= 0 && !matched.schedule.empty()) {
         scheduled = scheduleCheck ? scheduleCheck(matched.schedule,now) : -1;
         if (scheduled < 0) return result; // policy/clock failure is not_ready, never a close request
     }
-    if (matched.slot>=0 && matched.enabled && matched.remaining!=0 && scheduled == 1) {
+    if (!result.locked && matched.slot>=0 && matched.enabled && matched.remaining!=0 && scheduled == 1) {
         result.response=(mode==0 && alreadyDisarmed)?6:mode;
         // Only accepted physical keypad DISARM consumes a use. REST and ARM do not.
         if (mode==0 && matched.remaining>0) --matched.remaining;
