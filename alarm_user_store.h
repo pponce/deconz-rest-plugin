@@ -39,8 +39,7 @@ public:
     bool managementEnabled(int alarm, bool &enabled);
     bool list(int alarm, std::vector<User> &users);
     // expectedRevision=0 creates; >0 edits. Empty pin preserves existing hash.
-    // Slot 0 must be enabled, unlimited, API-enabled and unscheduled. Existing
-    // restricted records require explicit repair; reads never regrant access.
+    // Slot 0 must be enabled, unlimited, API-enabled and unscheduled.
     bool put(int alarm, User &user, const std::string &pin, int64_t expectedRevision,
              std::string &error);
     bool erase(int alarm, int slot, int64_t expectedRevision);

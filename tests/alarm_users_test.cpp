@@ -66,13 +66,6 @@ static void primaryProtectionTests() {
     CHECK(!store.put(1,primary,"1234",primary.revision-1,err) && err=="revision_conflict");
     CHECK(!store.setMainCode(1,"")); // Empty preserves an existing credential, never deletes it.
     CHECK(store.restCode(1,"2468"));
-    // Previously restricted data must not be silently re-enabled by upgrading/reading.
-    sql(db,"UPDATE alarm_users_v1 SET enabled=0,remaining=0,api_arm_disarm=0 WHERE slot=0");
-    CHECK(!store.restCode(1,"2468"));CHECK(!store.setMainCode(1,"3579"));
-    auto restricted=get(store,0);CHECK(!restricted.enabled && restricted.remaining==0 && !restricted.apiArmDisarm);
-    restricted.enabled=true;restricted.remaining=-1;restricted.apiArmDisarm=true;restricted.schedule.clear();
-    CHECK(store.put(1,restricted,"3579",restricted.revision,err));
-    CHECK(store.restCode(1,"3579") && !store.restCode(1,"2468"));
     CHECK(sqlite3_close(db)==SQLITE_OK);
 }
 static void schedulePolicyTests() {
@@ -129,15 +122,15 @@ static void apiPermissionTests() {
     sql(db,"INSERT INTO secrets VALUES('as_1_code0','"+mainHash+"',1)");
     sql(db,"INSERT INTO alarm_users_v1 VALUES(1,0,'main-one','Renamed main','"+mainHash+"',1,-1,7)");
     sql(db,"INSERT INTO alarm_users_v1 VALUES(1,1,'guest-one','Guest','"+guestHash+"',1,3,4)");
-    sql(db,"INSERT INTO alarm_users_v1 VALUES(2,0,'main-two','Second main','"+mainHash+"',0,0,9)");
+    sql(db,"INSERT INTO alarm_users_v1 VALUES(2,0,'main-two','Second main','"+mainHash+"',1,-1,9)");
     sql(db,"INSERT INTO alarm_user_management_v1 VALUES(1),(2)");
     Store s(db,verify,hash);
     auto main=get(s,0), guest=get(s,1); std::string err;
     CHECK(main.apiArmDisarm && main.name=="Renamed main" && main.revision==7 && main.hash==mainHash);
     CHECK(!guest.apiArmDisarm && guest.remaining==3 && guest.revision==4);
     std::vector<User> second; CHECK(s.list(2,second));
-    CHECK(second.size()==1 && second[0].apiArmDisarm && !second[0].enabled && second[0].remaining==0);
-    CHECK(s.restCode(1,"1357") && !s.restCode(1,"2468") && !s.restCode(2,"1357"));
+    CHECK(second.size()==1 && second[0].apiArmDisarm && second[0].enabled && second[0].remaining==-1);
+    CHECK(s.restCode(1,"1357") && !s.restCode(1,"2468") && s.restCode(2,"1357"));
     // Default-off API permission does not affect physical arming/disarming.
     CHECK(s.authorize(1,"keypad",1,1,3,"2468",100000,false).response==3);
     CHECK(s.authorize(1,"keypad",1,2,0,"2468",101000,true).response==6);

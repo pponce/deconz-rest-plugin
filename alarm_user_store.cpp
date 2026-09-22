@@ -206,7 +206,7 @@ bool Store::setMainCode(int alarm, const std::string &pin) {
     User u; u.slot=0; u.name="Main"; u.apiArmDisarm=true;
     for (const auto &x:users) if (x.slot==0) u=x;
     std::string error;
-    return put(alarm,u,pin,u.revision,error); // restricted legacy records require explicit policy repair
+    return put(alarm,u,pin,u.revision,error); // uses the same protected-primary validation as the users API
 }
 Result Store::authorize(int alarm,const std::string &source,int endpoint,int sequence,
                         int mode,const std::string &pin,int64_t now,bool alreadyDisarmed) {
