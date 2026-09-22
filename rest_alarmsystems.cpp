@@ -186,13 +186,25 @@ static QVariantMap alarmSystemToMap(const AlarmSystem *alarmSys)
 }
 
 // Explicit endpoint: names/identities are not included in gateway full-state dumps.
-static QVariantMap userToMap(const AlarmUsers::User &u)
+static QVariantMap userToMap(const AlarmUsers::User &u, bool global = false)
 {
     QVariantMap map;
     map[QLatin1String("id")] = QString::fromStdString(u.id);
-    map[QLatin1String("slot")] = u.slot;
+
     map[QLatin1String("name")] = QString::fromStdString(u.name);
     map[QLatin1String("enabled")] = u.enabled;
+    map["user_revision"] = qlonglong(u.userRevision);
+    if (global) { map["revision"] = qlonglong(u.userRevision); return map; }
+    map["grant_enabled"] = u.grantEnabled;
+    map["owner"] = u.owner;
+    map["arm"] = u.arm;
+    map["disarm"] = u.disarm;
+    map["all_keypads"] = u.allKeypads;
+    QVariantList keypads;
+    for (const auto &p : u.keypads) {
+        QVariantMap row; row["source"] = QString::fromStdString(p.source); row["endpoint"] = p.endpoint; keypads.append(row);
+    }
+    map["keypads"] = keypads;
     map[QLatin1String("api_arm_disarm")] = u.apiArmDisarm;
     map[QLatin1String("remaining_uses")] = u.remaining < 0 ? QVariant() : QVariant(qlonglong(u.remaining));
     map[QLatin1String("revision")] = qlonglong(u.revision);
@@ -202,22 +214,26 @@ static QVariantMap userToMap(const AlarmUsers::User &u)
 
 static int handleAlarmUsers(const ApiRequest &req, ApiResponse &rsp, AlarmSystems &systems)
 {
-    const int alarm = alarmSystemIdToInteger(req.hdr.pathAt(3));
+    const bool global = req.hdr.pathAt(3) == QLatin1String("users");
+    const int collection = global ? 4 : 5;
+    const int count = req.hdr.pathComponentsCount();
+    const int alarm = global ? 0 : alarmSystemIdToInteger(req.hdr.pathAt(3));
     AlarmSystem *sys = AS_GetAlarmSystem(alarm, systems);
     auto fail = [&](const char *reason, bool storage = false) {
         rsp.httpStatus = storage ? HttpStatusServiceUnavailable : HttpStatusBadRequest;
         rsp.list.append(errorToMap(ERR_INVALID_VALUE, QString("/alarmsystems/%1/users").arg(alarm), QLatin1String(reason)));
         return REQ_READY_SEND;
     };
-    if (!sys) return fail("alarm_not_found");
-    if (req.hdr.pathComponentsCount() == 6 && req.hdr.pathAt(5) == QLatin1String("capabilities") && req.hdr.httpMethod() == HttpGet) {
+    if (!global && !sys) return fail("alarm_not_found");
+    if (!global && req.hdr.pathComponentsCount() == 6 && req.hdr.pathAt(5) == QLatin1String("capabilities") && req.hdr.httpMethod() == HttpGet) {
         bool managed = false;
         if (!sys->userManagementEnabled(managed)) return fail("storage_error", true);
         rsp.map[QLatin1String("managed")] = managed;
         rsp.map[QLatin1String("api_arm_disarm")] = true;
         rsp.map[QLatin1String("schedules")] = true;
         rsp.map[QLatin1String("schedule_version")] = 1;
-        rsp.map[QLatin1String("protected_primary_slot")] = 0;
+        rsp.map[QLatin1String("global_users_version")] = 2;
+        rsp.map[QLatin1String("per_alarm_grants")] = true;
         rsp.map[QLatin1String("access_event_version")] = 1;
         rsp.map[QLatin1String("rest_command_events")] = true;
         rsp.map[QLatin1String("alarm_timing_version")] = 1;
@@ -228,7 +244,7 @@ static int handleAlarmUsers(const ApiRequest &req, ApiResponse &rsp, AlarmSystem
         return REQ_READY_SEND;
     }
     // Authenticated users API; policy is independent of managed-user opt-in.
-    if (req.hdr.pathComponentsCount() == 6 && req.hdr.pathAt(5) == QLatin1String("lockout")) {
+    if (!global && req.hdr.pathComponentsCount() == 6 && req.hdr.pathAt(5) == QLatin1String("lockout")) {
         AlarmUsers::LockoutPolicy p; std::vector<AlarmUsers::LockoutState> states;
         const auto integer = [](const QVariant &v,qint64 &out) {
             if(v.type()!=QVariant::Double && v.type()!=QVariant::Int && v.type()!=QVariant::LongLong && v.type()!=QVariant::UInt)return false;
@@ -274,96 +290,99 @@ static int handleAlarmUsers(const ApiRequest &req, ApiResponse &rsp, AlarmSystem
         rsp.map["keypads"]=rows;rsp.httpStatus=HttpStatusOk;return REQ_READY_SEND;
     }
     std::vector<AlarmUsers::User> users;
-    if (!sys->users(users)) return fail("storage_error", true);
-    if (req.hdr.pathComponentsCount() == 5 && req.hdr.httpMethod() == HttpGet) {
-        for (const auto &u : users) rsp.map[QString::number(u.slot)] = userToMap(u);
-        if (users.empty()) rsp.str = QLatin1String("{}");
-        rsp.httpStatus = HttpStatusOk;
-        return REQ_READY_SEND;
+    if (!AS_UserStore().list(global ? 0 : alarm,users)) return fail("storage_error",true);
+    if (count==collection && req.hdr.httpMethod()==HttpGet) {
+        for(const auto &u:users)rsp.map[QString::fromStdString(u.id)]=userToMap(u,global);
+        if(users.empty())rsp.str=QLatin1String("{}");
+        rsp.httpStatus=HttpStatusOk;return REQ_READY_SEND;
     }
-    if (req.hdr.pathComponentsCount() != 6) return REQ_NOT_HANDLED;
-    const auto part = req.hdr.pathAt(5);
-    if (part.size() != 1 || part.data()[0] < '0' || part.data()[0] > '8') return fail("invalid_slot");
-    const int slot = part.data()[0] - '0';
-    auto found = std::find_if(users.begin(), users.end(), [slot](const AlarmUsers::User &u) { return u.slot == slot; });
-    if (req.hdr.httpMethod() == HttpGet) {
-        if (found == users.end()) return fail("user_not_found");
-        rsp.map = userToMap(*found); rsp.httpStatus = HttpStatusOk; return REQ_READY_SEND;
+    const bool create=count==collection && req.hdr.httpMethod()==HttpPost;
+    if(!create && count!=collection+1)return REQ_NOT_HANDLED;
+    const QString uid=create?QString():QString(req.hdr.pathAt(collection));
+    if(!create && (uid.size()!=32 || std::any_of(uid.begin(),uid.end(),[](QChar c){return !(c>='0'&&c<='9')&&!(c>='a'&&c<='f');})))return fail("invalid_user_id");
+    auto found=std::find_if(users.begin(),users.end(),[&](const AlarmUsers::User &u){return QString::fromStdString(u.id)==uid;});
+    if(req.hdr.httpMethod()==HttpGet) {
+        if(found==users.end())return fail("user_not_found");
+        rsp.map=userToMap(*found,global);rsp.httpStatus=HttpStatusOk;return REQ_READY_SEND;
     }
-    if (req.hdr.httpMethod() != HttpPut && req.hdr.httpMethod() != HttpDelete) return REQ_NOT_HANDLED;
-    bool ok = false;
-    const QVariant parsed = Json::parse(req.content, ok);
-    const QVariantMap body = parsed.toMap();
-    if (!ok || parsed.type() != QVariant::Map || body.isEmpty()) return fail("invalid_body");
-    // A mandatory revision prevents stale edits/reset requests from restoring uses.
-    const auto number = [](const QVariant &v, qint64 &out) {
-        if (v.type() != QVariant::Double && v.type() != QVariant::Int && v.type() != QVariant::LongLong && v.type() != QVariant::UInt) return false;
-        const double d = v.toDouble();
-        if (!std::isfinite(d) || d < 0 || d > 9007199254740991.0 || std::floor(d) != d) return false;
-        out = qint64(d); return true;
+    if(!create && req.hdr.httpMethod()!=HttpPut && req.hdr.httpMethod()!=HttpDelete)return REQ_NOT_HANDLED;
+    bool ok=false;const QVariant parsed=Json::parse(req.content,ok);const auto body=parsed.toMap();
+    if(!ok||parsed.type()!=QVariant::Map||body.isEmpty())return fail("invalid_body");
+    const auto number=[](const QVariant &v,qint64 &out){
+        if(v.type()!=QVariant::Double && v.type()!=QVariant::Int && v.type()!=QVariant::LongLong && v.type()!=QVariant::UInt)return false;
+        const double d=v.toDouble();if(!std::isfinite(d)||d<0||d>9007199254740991.0||std::floor(d)!=d)return false;
+        out=qint64(d);return true;
     };
-    qint64 revision = 0;
-    if (!number(body.value(QLatin1String("revision")), revision)) return fail("revision_required");
-    if (req.hdr.httpMethod() == HttpDelete) {
-        if (body.size() != 1) return fail("unknown_field");
-        if (slot == 0) return fail("primary_user_protected");
-        if (!sys->deleteUser(slot, revision)) return fail("delete_failed_or_revision_conflict");
-        rsp.httpStatus = HttpStatusOk;
-        rsp.map[QLatin1String("deleted")] = slot;
-        return REQ_READY_SEND;
+    qint64 revision=0,userRevision=0;
+    if(!number(body.value("revision"),revision)||!number(body.value("user_revision"),userRevision))return fail("revision_required");
+    if(req.hdr.httpMethod()==HttpDelete) {
+        if(body.size()!=2)return fail("unknown_field");
+        if(!AS_UserStore().erase(global?0:alarm,uid.toStdString(),revision,userRevision))return fail("delete_failed_or_revision_conflict");
+        rsp.map["deleted"]=uid;rsp.httpStatus=HttpStatusOk;return REQ_READY_SEND;
     }
-    const QStringList allowed = {"revision", "name", "pin", "enabled", "remaining_uses", "api_arm_disarm", "schedule"};
-    for (auto i = body.cbegin(); i != body.cend(); ++i) if (!allowed.contains(i.key())) return fail("unknown_field");
+    QStringList allowed={"revision","user_revision","name","enabled","pin"};
+    if(!global)allowed.append({"grant_enabled","owner","arm","disarm","api_arm_disarm","all_keypads","keypads","remaining_uses","schedule"});
+    for(auto i=body.cbegin();i!=body.cend();++i)if(!allowed.contains(i.key()))return fail("unknown_field");
     AlarmUsers::User u;
-    u.apiArmDisarm = slot == 0; // only the default Main account starts API-enabled
-    if (found != users.end()) u = *found;
-    u.slot = slot;
-    if (body.contains(QLatin1String("schedule"))) {
-        const QVariant value = body.value(QLatin1String("schedule"));
-        if (value.isNull()) u.schedule.clear();
-        else if (value.type() == QVariant::Map) {
-            u.schedule = QJsonDocument::fromVariant(value).toJson(QJsonDocument::Compact).toStdString();
-            if (AlarmUsers::checkSchedule(u.schedule, 0) != 1) return fail("invalid_schedule");
-        } else return fail("invalid_schedule");
+    if(found!=users.end())u=*found;
+    else if(!create) {
+        if(global)return fail("user_not_found");
+        std::vector<AlarmUsers::User> identities;
+        if(!AS_UserStore().list(0,identities))return fail("storage_error",true);
+        auto identity=std::find_if(identities.begin(),identities.end(),[&](const AlarmUsers::User &x){return QString::fromStdString(x.id)==uid;});
+        if(identity==identities.end())return fail("user_not_found");
+        u=*identity;
+    }
+    u.userRevision=userRevision;
+    if(body.contains("name")) {
+        if(body.value("name").type()!=QVariant::String)return fail("invalid_name");
+        u.name=body.value("name").toString().toStdString();
     }
     QString pin;
-    if (body.contains(QLatin1String("pin"))) {
-        const QVariant value = body.value(QLatin1String("pin"));
-        if (value.type() != QVariant::String || value.toString().isEmpty()) return fail("invalid_pin");
-        pin = value.toString();
+    if(body.contains("pin")) {
+        if(body.value("pin").type()!=QVariant::String||body.value("pin").toString().isEmpty())return fail("invalid_pin");
+        pin=body.value("pin").toString();
     }
-    if (body.contains(QLatin1String("name"))) {
-        const QVariant value = body.value(QLatin1String("name"));
-        if (value.type() != QVariant::String) return fail("invalid_name");
-        u.name = value.toString().toStdString();
-    }
-    if (body.contains(QLatin1String("enabled"))) {
-        const QVariant value = body.value(QLatin1String("enabled"));
-        if (value.type() != QVariant::Bool) return fail("invalid_enabled");
-        u.enabled = value.toBool();
-    }
-    if (body.contains(QLatin1String("api_arm_disarm"))) {
-        const QVariant value = body.value(QLatin1String("api_arm_disarm"));
-        if (value.type() != QVariant::Bool) return fail("invalid_api_arm_disarm");
-        u.apiArmDisarm = value.toBool();
-    }
-    if (body.contains(QLatin1String("remaining_uses"))) {
-        const QVariant value = body.value(QLatin1String("remaining_uses"));
-        qint64 remaining = 0;
-        if (value.isNull()) u.remaining = -1;
-        else if (number(value, remaining) && remaining <= 1000000) u.remaining = remaining;
+    const auto boolean=[&](const char *key,bool &out){
+        if(!body.contains(key))return true;
+        if(body.value(key).type()!=QVariant::Bool)return false;
+        out=body.value(key).toBool();return true;
+    };
+    if(!boolean("enabled",u.enabled)||!boolean("grant_enabled",u.grantEnabled)||!boolean("owner",u.owner)||
+       !boolean("arm",u.arm)||!boolean("disarm",u.disarm)||!boolean("api_arm_disarm",u.apiArmDisarm)||!boolean("all_keypads",u.allKeypads))return fail("invalid_user");
+    if(body.contains("remaining_uses")) {
+        qint64 remaining=0;const auto value=body.value("remaining_uses");
+        if(value.isNull())u.remaining=-1;
+        else if(number(value,remaining)&&remaining<=1000000)u.remaining=remaining;
         else return fail("invalid_remaining_uses");
     }
+    if(body.contains("schedule")) {
+        const auto value=body.value("schedule");
+        if(value.isNull())u.schedule.clear();
+        else if(value.type()==QVariant::Map)u.schedule=QJsonDocument::fromVariant(value).toJson(QJsonDocument::Compact).toStdString();
+        else return fail("invalid_schedule");
+    }
+    if(body.contains("keypads")) {
+        const auto value=body.value("keypads");if(value.type()!=QVariant::List)return fail("invalid_keypads");
+        u.keypads.clear();
+        for(const auto &v:value.toList()) {
+            if(v.type()!=QVariant::Map)return fail("invalid_keypads");
+            const auto pad=v.toMap();qint64 endpoint;
+            if(pad.size()!=2||pad.value("source").type()!=QVariant::String||!number(pad.value("endpoint"),endpoint)||endpoint<1||endpoint>240)return fail("invalid_keypads");
+            u.keypads.push_back({pad.value("source").toString().toStdString(),int(endpoint)});
+        }
+    }
     std::string error;
-    if (!sys->putUser(u, pin, revision, error)) return fail(error.c_str(), error == "storage_error");
-    rsp.map = userToMap(u); rsp.httpStatus = HttpStatusOk;
-    return REQ_READY_SEND;
+    const bool saved=global?AS_UserStore().put(0,u,pin.toStdString(),revision,error):sys->putUser(u,pin,revision,error);
+    if(!saved)return fail(error.c_str(),error=="storage_error");
+    rsp.map=userToMap(u,global);rsp.httpStatus=HttpStatusOk;return REQ_READY_SEND;
 }
 
 int AS_handleAlarmSystemsApi(const ApiRequest &req, ApiResponse &rsp, AlarmSystems &alarmSystems, EventEmitter *eventEmitter)
 {
     Q_UNUSED(eventEmitter);
-    if (req.hdr.pathComponentsCount() >= 5 && req.hdr.pathAt(4) == QLatin1String("users"))
+    if ((req.hdr.pathComponentsCount() >= 5 && req.hdr.pathAt(4) == QLatin1String("users")) ||
+        (req.hdr.pathComponentsCount() >= 4 && req.hdr.pathAt(3) == QLatin1String("users")))
         return handleAlarmUsers(req, rsp, alarmSystems);
 
     // GET /api/<apikey>/alarmsystems
@@ -684,7 +703,7 @@ static int putAlarmSystemArmMode(const ApiRequest &req, ApiResponse &rsp, AlarmS
         return REQ_READY_SEND;
     }
     AlarmUsers::RestResult decision;
-    if (managed) decision = alarmSys->authorizeRest(code0);
+    if (managed) decision = alarmSys->authorizeRest(code0, int(mode));
     else { decision.ok = true; decision.accepted = alarmSys->isValidCode(code0, 0); }
     if (!decision.ok) {
         rsp.list.append(errInternalError(id, QLatin1String("credential storage unavailable")));
@@ -950,5 +969,6 @@ static int deleteAlarmSystemDevice(const ApiRequest &req, ApiResponse &rsp, Alar
 
     return REQ_READY_SEND;
 }
+
 
 

@@ -8,13 +8,16 @@
 struct sqlite3;
 
 namespace AlarmUsers {
-constexpr int MaxUsers = 9;
+constexpr int MaxUsers = 256;
 constexpr int64_t DuplicateWindowMs = 10000;
+struct Keypad { std::string source; int endpoint = 0; };
 struct User {
-    int slot = -1;
     std::string id, name, hash;
     std::string schedule; // canonical JSON; empty = no schedule/expiry
     bool enabled = true;
+    int64_t userRevision = 0;
+    bool grantEnabled = true, owner = false, arm = true, disarm = true, allKeypads = false;
+    std::vector<Keypad> keypads;
     bool apiArmDisarm = false; // REST alarm commands only; keypad eligibility is separate
     int64_t remaining = -1; // -1 unlimited; zero exhausted
     int64_t revision = 0;
@@ -51,7 +54,7 @@ using ScheduleCheck = std::function<int(const std::string &, int64_t)>; // -1 er
 using Hash = std::function<std::string(const std::string &)>;
 
 // Caller supplies the gateway DB connection; every mutation commits before success.
-// Main code (slot 0) remains mirrored in secrets for legacy REST compatibility.
+// alarm=0 lists/edits gateway identities; positive alarm IDs address grants.
 class Store {
 public:
     Store(sqlite3 *db, Verify verify, Hash hash, ScheduleCheck check = {});
@@ -62,13 +65,12 @@ public:
     bool resetLockout(int alarm);
     bool list(int alarm, std::vector<User> &users);
     // expectedRevision=0 creates; >0 edits. Empty pin preserves existing hash.
-    // Slot 0 must be enabled, unlimited, API-enabled and unscheduled.
+    // Every managed alarm must retain an enabled unrestricted owner grant.
     bool put(int alarm, User &user, const std::string &pin, int64_t expectedRevision,
              std::string &error);
-    bool erase(int alarm, int slot, int64_t expectedRevision);
-    RestResult authorizeRest(int alarm, const std::string &pin, int64_t nowMs = -1);
+    bool erase(int alarm, const std::string &uid, int64_t expectedRevision, int64_t userRevision);
+    RestResult authorizeRest(int alarm, const std::string &pin, int64_t nowMs = -1, int mode = 0);
     bool restCode(int alarm, const std::string &pin, int64_t nowMs = -1); // API permission + eligibility; never consumes uses
-    bool setMainCode(int alarm, const std::string &pin); // legacy config/code0
     Result authorize(int alarm, const std::string &source, int endpoint, int sequence,
                      int mode, const std::string &pin, int64_t nowMs, bool alreadyDisarmed);
 private:
@@ -82,4 +84,5 @@ private:
 };
 }
 #endif
+
 

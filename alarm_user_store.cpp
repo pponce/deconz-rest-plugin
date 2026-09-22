@@ -29,14 +29,7 @@ bool validPin(const std::string &pin) {
     return pin.size() >= 4 && pin.size() <= 16 &&
         std::all_of(pin.begin(), pin.end(), [](char c) { return c >= '0' && c <= '9'; });
 }
-std::string legacyKey(int alarm) { return "as_" + std::to_string(alarm) + "_code0"; }
-bool mirror(sqlite3 *db, int alarm, const User &u) {
-    if (u.slot != 0) return true;
-    Statement s(db, "INSERT OR REPLACE INTO secrets(uniqueid,secret,state) VALUES(?,?,?)");
-    if (!s.valid()) return false;
-    s.text(1, legacyKey(alarm)); s.text(2, u.hash); s.number(3, u.enabled ? 1 : 0);
-    return s.step() == SQLITE_DONE;
-}
+
 }
 Store::Store(sqlite3 *d, Verify v, Hash h, ScheduleCheck check)
     : db(d), verify(std::move(v)), hash(std::move(h)), scheduleCheck(std::move(check)) {}
@@ -44,183 +37,205 @@ Store::Store(sqlite3 *d, Verify v, Hash h, ScheduleCheck check)
 bool Store::managementEnabled(int alarm, bool &enabled) {
     enabled = false;
     if (!db || alarm < 1 || alarm > 255) return false;
-    Statement exists(db, "SELECT 1 FROM sqlite_master WHERE type='table' AND name='alarm_user_management_v1'");
+    // An unconverted experimental database must never fall through to legacy PINs.
+    Statement old(db, "SELECT 1 FROM sqlite_master WHERE type='table' AND name='alarm_user_management_v1'");
+    if (!old.valid()) return false;
+    if (old.step() == SQLITE_ROW) {
+        Statement rows(db, "SELECT 1 FROM alarm_user_management_v1 LIMIT 1");
+        if (!rows.valid() || rows.step() != SQLITE_DONE) return false;
+    }
+    Statement exists(db, "SELECT 1 FROM sqlite_master WHERE type='table' AND name='alarm_user_management_v2'");
     if (!exists.valid()) return false;
     const int rc = exists.step();
-    if (rc == SQLITE_DONE) return true; // Existing installations need no schema migration.
+    if (rc == SQLITE_DONE) return true;
     if (rc != SQLITE_ROW) return false;
-    Statement s(db, "SELECT 1 FROM alarm_user_management_v1 WHERE alarm=?");
+    Statement s(db, "SELECT 1 FROM alarm_user_management_v2 WHERE alarm=?");
     if (!s.valid()) return false;
-    s.number(1, alarm);
-    const int found = s.step();
+    s.number(1, alarm); const int found = s.step();
     enabled = found == SQLITE_ROW;
     return enabled || found == SQLITE_DONE;
 }
 
 bool Store::activate(int alarm) {
-    Statement s(db, "INSERT OR IGNORE INTO alarm_user_management_v1 VALUES(?)");
+    Statement s(db, "INSERT OR IGNORE INTO alarm_user_management_v2 VALUES(?)");
     if (!s.valid()) return false;
-    s.number(1, alarm);
-    return s.step() == SQLITE_DONE;
+    s.number(1, alarm); return s.step() == SQLITE_DONE;
 }
 
 bool Store::init(int alarm) {
-    if (!db || alarm < 1 || alarm > 255) return false;
-    // Additive schema. No changes to upstream table layout or user_version.
-    if (!exec(db, "CREATE TABLE IF NOT EXISTS alarm_user_management_v1 (alarm INTEGER PRIMARY KEY)") ||
-        !exec(db, "CREATE TABLE IF NOT EXISTS alarm_users_v1 ("
-        "alarm INTEGER NOT NULL, slot INTEGER NOT NULL CHECK(slot BETWEEN 0 AND 8),"
-        "uid TEXT NOT NULL UNIQUE, name TEXT NOT NULL, hash TEXT NOT NULL,"
-        "enabled INTEGER NOT NULL CHECK(enabled IN (0,1)),"
-        "remaining INTEGER NOT NULL CHECK(remaining>=-1), revision INTEGER NOT NULL,"
-        "PRIMARY KEY(alarm,slot))") ||
-        !exec(db, "CREATE TABLE IF NOT EXISTS alarm_user_requests_v1 ("
-        "alarm INTEGER NOT NULL,source TEXT NOT NULL,endpoint INTEGER NOT NULL,"
-        "sequence INTEGER NOT NULL,mode INTEGER NOT NULL,created INTEGER NOT NULL,"
-        "uid TEXT NOT NULL,response INTEGER NOT NULL,eventid TEXT NOT NULL,"
-        "PRIMARY KEY(alarm,source,endpoint,sequence))")) return false;
-    if (!exec(db, "CREATE TABLE IF NOT EXISTS alarm_user_schedules_v1 (uid TEXT PRIMARY KEY, policy TEXT NOT NULL)")) return false;
-    if (!exec(db, "CREATE TABLE IF NOT EXISTS alarm_lockout_policy_v1 (alarm INTEGER PRIMARY KEY,enabled INTEGER NOT NULL,threshold INTEGER NOT NULL,window INTEGER NOT NULL,d1 INTEGER NOT NULL,d2 INTEGER NOT NULL,d3 INTEGER NOT NULL,reset INTEGER NOT NULL,revision INTEGER NOT NULL)") ||
-        !exec(db, "CREATE TABLE IF NOT EXISTS alarm_lockout_state_v1 (alarm INTEGER NOT NULL,source TEXT NOT NULL,endpoint INTEGER NOT NULL,level INTEGER NOT NULL,until INTEGER NOT NULL,last_failure INTEGER NOT NULL,PRIMARY KEY(alarm,source,endpoint))") ||
-        !exec(db, "CREATE TABLE IF NOT EXISTS alarm_lockout_failures_v1 (alarm INTEGER NOT NULL,source TEXT NOT NULL,endpoint INTEGER NOT NULL,created INTEGER NOT NULL)")) return false;
-    bool permissionColumn = false;
-    {
-        Statement columns(db, "PRAGMA table_info(alarm_users_v1)");
-        if (!columns.valid()) return false;
-        int rc;
-        while ((rc = columns.step()) == SQLITE_ROW)
-            if (columns.text(1) == "api_arm_disarm") permissionColumn = true;
-        if (rc != SQLITE_DONE) return false;
-    }
-    if (!permissionColumn) {
-        if (!exec(db, "ALTER TABLE alarm_users_v1 ADD COLUMN api_arm_disarm INTEGER NOT NULL DEFAULT 0 CHECK(api_arm_disarm IN (0,1))") ||
-            !exec(db, "UPDATE alarm_users_v1 SET api_arm_disarm=1 WHERE slot=0")) return false;
-    }
-    Statement s(db, "INSERT OR IGNORE INTO alarm_users_v1(alarm,slot,uid,name,hash,enabled,remaining,revision,api_arm_disarm) "
-        "SELECT ?,0,lower(hex(randomblob(16))),'Main',secret,CASE WHEN state=1 THEN 1 ELSE 0 END,-1,1,1 "
-        "FROM secrets WHERE uniqueid=? AND length(secret)>0");
-    if (!s.valid()) return false;
-    s.number(1, alarm); s.text(2, legacyKey(alarm));
-    if (s.step() != SQLITE_DONE) return false;
-    bool managed = false;
-    if (!managementEnabled(alarm, managed)) return false;
-    if (!managed) {
-        // GET /users does not opt in. Reflect subsequent legacy code0 edits until
-        // an explicit successful user mutation activates management atomically.
-        Statement refresh(db, "UPDATE alarm_users_v1 SET hash=(SELECT secret FROM secrets WHERE uniqueid=?),"
-            "enabled=1,remaining=-1,revision=revision+1 WHERE alarm=? AND slot=0 AND "
-            "EXISTS(SELECT 1 FROM secrets WHERE uniqueid=? AND (secret<>hash OR enabled<>1 OR remaining<>-1))");
-        if (!refresh.valid()) return false;
-        refresh.text(1, legacyKey(alarm)); refresh.number(2, alarm); refresh.text(3, legacyKey(alarm));
-        if (refresh.step() != SQLITE_DONE) return false;
-        Statement removed(db, "DELETE FROM alarm_users_v1 WHERE alarm=? AND slot=0 AND NOT EXISTS(SELECT 1 FROM secrets WHERE uniqueid=?)");
-        if (!removed.valid()) return false;
-        removed.number(1, alarm); removed.text(2, legacyKey(alarm));
-        if (removed.step() != SQLITE_DONE) return false;
-    }
-    return true;
+    bool enabled = false;
+    if (!db || alarm < 0 || alarm > 255 || !managementEnabled(alarm ? alarm : 1, enabled)) return false;
+    return exec(db,
+        "CREATE TABLE IF NOT EXISTS gateway_users_v2 (uid TEXT PRIMARY KEY,name TEXT NOT NULL,hash TEXT NOT NULL,"
+        "enabled INTEGER NOT NULL CHECK(enabled IN (0,1)),revision INTEGER NOT NULL CHECK(revision>0));"
+        "CREATE TABLE IF NOT EXISTS alarm_user_management_v2 (alarm INTEGER PRIMARY KEY CHECK(alarm BETWEEN 1 AND 255));"
+        "CREATE TABLE IF NOT EXISTS alarm_user_grants_v2 (alarm INTEGER NOT NULL CHECK(alarm BETWEEN 1 AND 255),uid TEXT NOT NULL,"
+        "enabled INTEGER NOT NULL CHECK(enabled IN (0,1)),owner INTEGER NOT NULL CHECK(owner IN (0,1)),"
+        "arm INTEGER NOT NULL CHECK(arm IN (0,1)),disarm INTEGER NOT NULL CHECK(disarm IN (0,1)),"
+        "api_arm_disarm INTEGER NOT NULL CHECK(api_arm_disarm IN (0,1)),all_keypads INTEGER NOT NULL CHECK(all_keypads IN (0,1)),"
+        "remaining INTEGER NOT NULL CHECK(remaining>=-1),schedule TEXT NOT NULL,revision INTEGER NOT NULL CHECK(revision>0),"
+        "PRIMARY KEY(alarm,uid),FOREIGN KEY(uid) REFERENCES gateway_users_v2(uid));"
+        "CREATE TABLE IF NOT EXISTS alarm_user_keypads_v2 (alarm INTEGER NOT NULL,uid TEXT NOT NULL,source TEXT NOT NULL,"
+        "endpoint INTEGER NOT NULL CHECK(endpoint BETWEEN 1 AND 240),PRIMARY KEY(alarm,uid,source,endpoint));"
+        "CREATE TABLE IF NOT EXISTS alarm_user_requests_v1 (alarm INTEGER NOT NULL,source TEXT NOT NULL,endpoint INTEGER NOT NULL,"
+        "sequence INTEGER NOT NULL,mode INTEGER NOT NULL,created INTEGER NOT NULL,uid TEXT NOT NULL,response INTEGER NOT NULL,"
+        "eventid TEXT NOT NULL,PRIMARY KEY(alarm,source,endpoint,sequence));"
+        "CREATE TABLE IF NOT EXISTS alarm_lockout_policy_v1 (alarm INTEGER PRIMARY KEY,enabled INTEGER NOT NULL,threshold INTEGER NOT NULL,"
+        "window INTEGER NOT NULL,d1 INTEGER NOT NULL,d2 INTEGER NOT NULL,d3 INTEGER NOT NULL,reset INTEGER NOT NULL,revision INTEGER NOT NULL);"
+        "CREATE TABLE IF NOT EXISTS alarm_lockout_state_v1 (alarm INTEGER NOT NULL,source TEXT NOT NULL,endpoint INTEGER NOT NULL,"
+        "level INTEGER NOT NULL,until INTEGER NOT NULL,last_failure INTEGER NOT NULL,PRIMARY KEY(alarm,source,endpoint));"
+        "CREATE TABLE IF NOT EXISTS alarm_lockout_failures_v1 (alarm INTEGER NOT NULL,source TEXT NOT NULL,endpoint INTEGER NOT NULL,created INTEGER NOT NULL);");
 }
+
 bool Store::read(int alarm, std::vector<User> &users) {
     users.clear();
-    Statement s(db, "SELECT slot,u.uid,name,hash,enabled,remaining,revision,api_arm_disarm,coalesce(p.policy,'') FROM alarm_users_v1 u LEFT JOIN alarm_user_schedules_v1 p ON p.uid=u.uid WHERE alarm=? ORDER BY slot");
+    Statement s(db, alarm ?
+        "SELECT u.uid,u.name,u.hash,u.enabled,u.revision,g.enabled,g.owner,g.arm,g.disarm,g.api_arm_disarm,g.all_keypads,"
+        "g.remaining,g.schedule,g.revision FROM gateway_users_v2 u JOIN alarm_user_grants_v2 g ON g.uid=u.uid WHERE g.alarm=? ORDER BY u.uid" :
+        "SELECT uid,name,hash,enabled,revision FROM gateway_users_v2 ORDER BY uid");
     if (!s.valid()) return false;
-    s.number(1, alarm);
+    if (alarm) s.number(1,alarm);
     int rc;
-    while ((rc = s.step()) == SQLITE_ROW) {
-        User u; u.slot = int(s.number(0)); u.id = s.text(1); u.name = s.text(2); u.hash = s.text(3);
-        u.enabled = s.number(4) != 0; u.remaining = s.number(5); u.revision = s.number(6);
-        if (s.number(7) != 0 && s.number(7) != 1) return false;
-        u.apiArmDisarm = s.number(7) == 1;
-        u.schedule = s.text(8);
+    while ((rc=s.step())==SQLITE_ROW) {
+        User u;u.id=s.text(0);u.name=s.text(1);u.hash=s.text(2);u.enabled=s.number(3)==1;u.userRevision=s.number(4);
+        if (alarm) {
+            u.grantEnabled=s.number(5)==1;u.owner=s.number(6)==1;u.arm=s.number(7)==1;u.disarm=s.number(8)==1;
+            u.apiArmDisarm=s.number(9)==1;u.allKeypads=s.number(10)==1;u.remaining=s.number(11);u.schedule=s.text(12);u.revision=s.number(13);
+            Statement pads(db,"SELECT source,endpoint FROM alarm_user_keypads_v2 WHERE alarm=? AND uid=? ORDER BY source,endpoint");
+            if (!pads.valid()) return false;
+            pads.number(1,alarm);pads.text(2,u.id);int pr;
+            while((pr=pads.step())==SQLITE_ROW) u.keypads.push_back({pads.text(0),int(pads.number(1))});
+            if(pr!=SQLITE_DONE)return false;
+        }
         users.push_back(u);
     }
-    return rc == SQLITE_DONE;
+    return rc==SQLITE_DONE;
 }
-bool Store::list(int alarm, std::vector<User> &users) {
-    Transaction t(db);
-    return t.active && init(alarm) && read(alarm, users) && t.commit();
+bool Store::list(int alarm,std::vector<User> &users) {
+    Transaction t(db);return t.active && init(alarm) && read(alarm,users) && t.commit();
 }
-bool Store::put(int alarm, User &u, const std::string &pin, int64_t revision, std::string &error) {
-    // Slot identity, not the editable display name, defines the primary user.
-    // Reject restrictions rather than silently correcting the submitted policy.
-    if (u.slot == 0 && (!u.enabled || !u.apiArmDisarm || u.remaining != -1 || !u.schedule.empty())) {
-        error = "primary_user_protected"; return false;
+
+namespace {
+bool ownersValid(sqlite3 *db) {
+    // Ownership is a role on a grant, independent of ID, ordering or display name.
+    Statement s(db,"SELECT 1 FROM alarm_user_management_v2 m WHERE NOT EXISTS ("
+        "SELECT 1 FROM alarm_user_grants_v2 g JOIN gateway_users_v2 u ON u.uid=g.uid WHERE g.alarm=m.alarm AND "
+        "g.owner=1 AND g.enabled=1 AND u.enabled=1 AND g.arm=1 AND g.disarm=1 AND g.api_arm_disarm=1 AND g.remaining=-1 AND g.schedule='') LIMIT 1");
+    return s.valid() && s.step()==SQLITE_DONE;
+}
+bool validId(const std::string &id) {
+    return id.size()==32 && std::all_of(id.begin(),id.end(),[](char c){return (c>='0'&&c<='9')||(c>='a'&&c<='f');});
+}
+bool validName(const std::string &name) {
+    return !name.empty() && name.size()<=64 && std::none_of(name.begin(),name.end(),[](unsigned char c){return c<32||c==127;});
+}
+bool validKeypad(const Keypad &p) {
+    return !p.source.empty() && p.source.size()<=16 && p.endpoint>=1 && p.endpoint<=240 &&
+        std::all_of(p.source.begin(),p.source.end(),[](char c){return (c>='0'&&c<='9')||(c>='a'&&c<='f');}) &&
+        (p.source.size()==1 || p.source[0]!='0');
+}
+}
+
+// One atomic transaction supports creating an identity with its first grant,
+// attaching an existing identity, and editing a projected identity/grant pair.
+// alarm=0 edits identity only; grant edits require BOTH revisions.
+bool Store::put(int alarm,User &u,const std::string &pin,int64_t revision,std::string &error) {
+    error="invalid_user";
+    if(alarm<0||alarm>255||!validName(u.name)||revision<0||u.userRevision<0||
+       (!u.id.empty()&&!validId(u.id))||(!pin.empty()&&!validPin(pin)))return false;
+    if(alarm && (u.remaining < -1 || u.remaining>1000000 || u.keypads.size()>256 || (u.allKeypads&&!u.keypads.empty())))return false;
+    for(const auto &p:u.keypads)if(!validKeypad(p))return false;
+    if(alarm && !u.schedule.empty() && (u.schedule.size()>8192||!scheduleCheck||scheduleCheck(u.schedule,0)!=1)) {
+        error="invalid_schedule";return false;
     }
-    error = "invalid_user";
-    if (u.slot < 0 || u.slot >= MaxUsers || u.name.empty() || u.name.size() > 64 ||
-        std::any_of(u.name.begin(), u.name.end(), [](unsigned char c) { return c < 32 || c == 127; }) ||
-        u.remaining < -1 || u.remaining > 1000000 || revision < 0 || (!pin.empty() && !validPin(pin))) return false;
-    if (!u.schedule.empty() && (u.schedule.size() > 8192 || !scheduleCheck || scheduleCheck(u.schedule, 0) != 1)) {
-        error = "invalid_schedule"; return false;
+    if(alarm && u.owner && (!u.enabled||!u.grantEnabled||!u.arm||!u.disarm||!u.apiArmDisarm||u.remaining!=-1||!u.schedule.empty())) {
+        error="owner_must_be_unrestricted";return false;
     }
-    error = "storage_error";
-    Transaction t(db); std::vector<User> users;
-    if (!t.active || !init(alarm) || !read(alarm, users)) return false;
-    auto old = std::find_if(users.begin(), users.end(), [&](const User &x) { return x.slot == u.slot; });
-    if ((old == users.end() && revision != 0) || (old != users.end() && old->revision != revision)) {
-        error = "revision_conflict"; return false;
+    error="storage_error";Transaction t(db);std::vector<User> identities,grants;
+    if(!t.active||!init(alarm)||!read(0,identities)||(alarm&&!read(alarm,grants)))return false;
+    auto old=std::find_if(identities.begin(),identities.end(),[&](const User &x){return x.id==u.id;});
+    auto grant=std::find_if(grants.begin(),grants.end(),[&](const User &x){return x.id==u.id;});
+    const bool creating=old==identities.end();
+    if((creating && (!u.id.empty()||u.userRevision!=0)) || (!creating && old->userRevision!=u.userRevision) ||
+       (alarm && (grant==grants.end()?revision!=0:grant->revision!=revision)) || (!alarm&&revision!=u.userRevision)) {
+        error="revision_conflict";return false;
     }
-    if (pin.empty() && old == users.end()) { error = "pin_required"; return false; }
-    if (!pin.empty()) {
-        for (const auto &x : users) if (x.slot != u.slot && verify(x.hash, pin)) {
-            error = "pin_already_assigned"; return false;
+    if(creating && identities.size()>=MaxUsers){error="user_limit";return false;}
+    if(creating && pin.empty()){error="pin_required";return false;}
+    // Attaching requires the current credential, not hash equality (salted hashes).
+    const bool attaching=alarm && !creating && grant==grants.end();
+    if(attaching && (pin.empty()||!verify(old->hash,pin))){error="current_pin_required";return false;}
+    if(!pin.empty()) {
+        // Union of all existing grants plus the proposed new alarm. Disabled
+        // identities and grants still reserve the PIN within those alarms.
+        Statement peers(db,"SELECT DISTINCT u.hash FROM gateway_users_v2 u JOIN alarm_user_grants_v2 g ON g.uid=u.uid "
+            "WHERE u.uid<>? AND (g.alarm=? OR g.alarm IN (SELECT alarm FROM alarm_user_grants_v2 WHERE uid=?))");
+        if(!peers.valid())return false;
+        peers.text(1,u.id);peers.number(2,alarm);peers.text(3,u.id);int rc;
+        while((rc=peers.step())==SQLITE_ROW)if(verify(peers.text(0),pin)){error="pin_already_assigned";return false;}
+        if(rc!=SQLITE_DONE)return false;
+    }
+    const bool identityChanged=creating||u.name!=old->name||u.enabled!=old->enabled||(!pin.empty()&&!attaching);
+    u.hash=creating||(!pin.empty()&&!attaching)?hash(pin):old->hash;
+    if(u.hash.empty())return false;
+    if(creating) {
+        Statement id(db,"SELECT lower(hex(randomblob(16)))");if(id.step()!=SQLITE_ROW)return false;u.id=id.text(0);
+    }
+    if(identityChanged) {
+        Statement save(db,"INSERT OR REPLACE INTO gateway_users_v2 VALUES(?,?,?,?,?)");
+        if(!save.valid())return false;
+        save.text(1,u.id);save.text(2,u.name);save.text(3,u.hash);save.number(4,u.enabled);save.number(5,u.userRevision+1);
+        if(save.step()!=SQLITE_DONE)return false;
+        ++u.userRevision;
+    }
+    if(alarm) {
+        Statement save(db,"INSERT OR REPLACE INTO alarm_user_grants_v2 VALUES(?,?,?,?,?,?,?,?,?,?,?)");
+        if(!save.valid())return false;
+        save.number(1,alarm);save.text(2,u.id);save.number(3,u.grantEnabled);save.number(4,u.owner);save.number(5,u.arm);save.number(6,u.disarm);
+        save.number(7,u.apiArmDisarm);save.number(8,u.allKeypads);save.number(9,u.remaining);save.text(10,u.schedule);save.number(11,revision+1);
+        if(save.step()!=SQLITE_DONE)return false;
+        Statement clear(db,"DELETE FROM alarm_user_keypads_v2 WHERE alarm=? AND uid=?");
+        if(!clear.valid())return false;
+        clear.number(1,alarm);clear.text(2,u.id);if(clear.step()!=SQLITE_DONE)return false;
+        for(const auto &p:u.keypads) {
+            Statement add(db,"INSERT INTO alarm_user_keypads_v2 VALUES(?,?,?,?)");if(!add.valid())return false;
+            add.number(1,alarm);add.text(2,u.id);add.text(3,p.source);add.number(4,p.endpoint);if(add.step()!=SQLITE_DONE)return false;
         }
-        u.hash = hash(pin);
-        if (u.hash.empty()) return false;
-    } else u.hash = old->hash;
-    Statement s(db, "INSERT OR REPLACE INTO alarm_users_v1(alarm,slot,uid,name,hash,enabled,remaining,revision,api_arm_disarm) "
-        "VALUES(?,?,coalesce((SELECT uid FROM alarm_users_v1 WHERE alarm=? AND slot=?),lower(hex(randomblob(16)))),?,?,?,?,?,?)");
-    if (!s.valid()) return false;
-    s.number(1,alarm); s.number(2,u.slot); s.number(3,alarm); s.number(4,u.slot);
-    s.text(5,u.name); s.text(6,u.hash); s.number(7,u.enabled); s.number(8,u.remaining); s.number(9,revision+1); s.number(10,u.apiArmDisarm);
-    if (s.step()!=SQLITE_DONE) return false;
-    Statement policy(db, "INSERT OR REPLACE INTO alarm_user_schedules_v1 SELECT uid,? FROM alarm_users_v1 WHERE alarm=? AND slot=?");
-    if (!policy.valid()) return false;
-    policy.text(1,u.schedule); policy.number(2,alarm); policy.number(3,u.slot);
-    if (policy.step()!=SQLITE_DONE || !mirror(db,alarm,u) || !activate(alarm) || !read(alarm,users) || !t.commit()) return false;
-    u = *std::find_if(users.begin(),users.end(),[&](const User &x){return x.slot==u.slot;});
-    error.clear(); return true;
-}
-bool Store::erase(int alarm, int slot, int64_t revision) {
-    if (slot <= 0 || slot >= MaxUsers || revision < 1) return false;
-    Transaction t(db);
-    if (!t.active || !init(alarm)) return false;
-    Statement s(db,"DELETE FROM alarm_users_v1 WHERE alarm=? AND slot=? AND revision=?");
-    if (!s.valid()) return false;
-    s.number(1,alarm); s.number(2,slot); s.number(3,revision);
-    if (s.step()!=SQLITE_DONE || sqlite3_changes(db)!=1) return false;
-    if (!exec(db,"DELETE FROM alarm_user_schedules_v1 WHERE uid NOT IN (SELECT uid FROM alarm_users_v1)")) return false;
-    return activate(alarm) && t.commit();
-}
-RestResult Store::authorizeRest(int alarm, const std::string &pin, int64_t now) {
-    RestResult result;
-    if (now == -1) now = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
-    std::vector<User> users;
-    if (!list(alarm,users)) return result;
-    for (const auto &u:users) {
-        if (!u.apiArmDisarm || !u.enabled || u.remaining == 0 || !verify(u.hash,pin)) continue;
-        const int allowed = u.schedule.empty() ? 1 :
-            (now > 0 && scheduleCheck ? scheduleCheck(u.schedule,now) : -1);
-        if (allowed < 0) return result;
-        if (allowed == 1) { result.accepted = true; result.user = u; }
-        break;
+        if(!activate(alarm))return false;
+        u.revision=revision+1;
     }
-    result.ok = true;
-    return result;
+    if(!ownersValid(db)){error="last_unrestricted_owner_required";return false;}
+    if(!t.commit())return false;
+    error.clear();return true;
 }
-bool Store::restCode(int alarm, const std::string &pin, int64_t now) {
-    const auto result = authorizeRest(alarm,pin,now);
-    return result.ok && result.accepted;
+
+bool Store::erase(int alarm,const std::string &uid,int64_t revision,int64_t userRevision) {
+    if(!validId(uid)||revision<1||userRevision<1)return false;
+    Transaction t(db);if(!t.active||!init(alarm))return false;
+    Statement s(db,alarm?"DELETE FROM alarm_user_grants_v2 WHERE alarm=? AND uid=? AND revision=? AND EXISTS(SELECT 1 FROM gateway_users_v2 WHERE uid=? AND revision=?)":
+        "DELETE FROM gateway_users_v2 WHERE ?=0 AND uid=? AND revision=? AND uid=? AND revision=? AND NOT EXISTS(SELECT 1 FROM alarm_user_grants_v2 WHERE uid=gateway_users_v2.uid)");
+    if(!s.valid())return false;
+    s.number(1,alarm);s.text(2,uid);s.number(3,revision);s.text(4,uid);s.number(5,userRevision);
+    if(s.step()!=SQLITE_DONE||sqlite3_changes(db)!=1||!ownersValid(db))return false;
+    Statement clear(db,"DELETE FROM alarm_user_keypads_v2 WHERE alarm=? AND uid=?");
+    if(!clear.valid())return false;
+    clear.number(1,alarm);clear.text(2,uid);return clear.step()==SQLITE_DONE&&t.commit();
 }
-bool Store::setMainCode(int alarm, const std::string &pin) {
-    if (!validPin(pin)) return false;
-    std::vector<User> users;
-    if (!list(alarm,users)) return false;
-    User u; u.slot=0; u.name="Main"; u.apiArmDisarm=true;
-    for (const auto &x:users) if (x.slot==0) u=x;
-    std::string error;
-    return put(alarm,u,pin,u.revision,error); // uses the same protected-primary validation as the users API
+RestResult Store::authorizeRest(int alarm,const std::string &pin,int64_t now,int mode) {
+    RestResult result;bool managed=false;
+    if(mode<0||mode>3||!managementEnabled(alarm,managed)||!managed)return result;
+    if(now==-1)now=std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+    std::vector<User> users;if(!list(alarm,users))return result;
+    for(const auto &u:users) {
+        if(!u.apiArmDisarm||!u.enabled||!u.grantEnabled||u.remaining==0||!(mode==0?u.disarm:u.arm)||!verify(u.hash,pin))continue;
+        const int allowed=u.schedule.empty()?1:(now>0&&scheduleCheck?scheduleCheck(u.schedule,now):-1);
+        if(allowed<0)return result;
+        if(allowed==1){result.accepted=true;result.user=u;}break;
+    }
+    result.ok=true;return result;
+}
+bool Store::restCode(int alarm,const std::string &pin,int64_t now) {
+    const auto r=authorizeRest(alarm,pin,now);return r.ok&&r.accepted;
 }
 namespace {
 bool validPolicy(const LockoutPolicy &p) {
@@ -337,7 +352,7 @@ Result Store::authorize(int alarm,const std::string &source,int endpoint,int seq
             result.locked=true; // No timer extension, credential check or usage mutation.
         } else {
             if(now-state.lastFailure>=int64_t(policy.resetSeconds)*1000)state.level=0;
-            if(matched.slot<0) {
+            if(matched.id.empty()) {
                 Statement prune(db,"DELETE FROM alarm_lockout_failures_v1 WHERE alarm=? AND source=? AND endpoint=? AND created<=?");
                 Statement add(db,"INSERT INTO alarm_lockout_failures_v1 VALUES(?,?,?,?)");
                 Statement count(db,"SELECT count(*) FROM alarm_lockout_failures_v1 WHERE alarm=? AND source=? AND endpoint=?");
@@ -363,17 +378,18 @@ Result Store::authorize(int alarm,const std::string &source,int endpoint,int seq
         if(result.locked){result.lockedUntil=state.until;result.lockoutLevel=state.level;}
     }
     int scheduled = 1;
-    if (!result.locked && matched.slot >= 0 && !matched.schedule.empty()) {
+    if (!result.locked && !matched.id.empty() && !matched.schedule.empty()) {
         scheduled = scheduleCheck ? scheduleCheck(matched.schedule,now) : -1;
         if (scheduled < 0) return result; // policy/clock failure is not_ready, never a close request
     }
-    if (!result.locked && matched.slot>=0 && matched.enabled && matched.remaining!=0 && scheduled == 1) {
+    if (!result.locked && !matched.id.empty() && matched.enabled && matched.grantEnabled && (mode==0?matched.disarm:matched.arm) &&
+        (matched.allKeypads || std::any_of(matched.keypads.begin(),matched.keypads.end(),[&](const Keypad &p){return p.source==source && p.endpoint==endpoint;})) && matched.remaining!=0 && scheduled == 1) {
         result.response=(mode==0 && alreadyDisarmed)?6:mode;
         // Only accepted physical keypad DISARM consumes a use. REST and ARM do not.
         if (mode==0 && matched.remaining>0) --matched.remaining;
-        Statement consume(db,"UPDATE alarm_users_v1 SET remaining=?,revision=revision+1 WHERE alarm=? AND slot=? AND revision=?");
+        Statement consume(db,"UPDATE alarm_user_grants_v2 SET remaining=?,revision=revision+1 WHERE alarm=? AND uid=? AND revision=?");
         if (!consume.valid()) return Result{};
-        consume.number(1,matched.remaining); consume.number(2,alarm); consume.number(3,matched.slot); consume.number(4,matched.revision);
+        consume.number(1,matched.remaining); consume.number(2,alarm); consume.text(3,matched.id); consume.number(4,matched.revision);
         if (consume.step()!=SQLITE_DONE || sqlite3_changes(db)!=1) return Result{};
         ++matched.revision; result.user=matched;
     }
@@ -394,3 +410,4 @@ Result Store::authorize(int alarm,const std::string &source,int endpoint,int seq
     result.ok=t.commit(); return result;
 }
 }
+

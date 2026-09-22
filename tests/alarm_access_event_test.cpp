@@ -14,7 +14,6 @@ int main()
         result.response = 4;
         result.eventId = "synthetic-event";
         // Even a matched but ineligible user must never be exposed by a rejection.
-        result.user.slot = 2;
         result.user.id = "synthetic-private-id";
         result.user.name = "synthetic-private-name";
         result.user.hash = "synthetic-private-hash";
@@ -56,7 +55,7 @@ int main()
         result.user.remaining = -1;
         CHECK(event()["uses_consumed"].toInt() == 0);
         CHECK(event()["remaining_uses"].isNull());
-        result.user.slot = -1;
+        result.user.id.clear();
         CHECK(event().isEmpty());
         result.response = 4;
         CHECK(!event().isEmpty());
@@ -70,7 +69,7 @@ int main()
         result.eventId.clear();
         CHECK(event().isEmpty());
         AlarmUsers::RestResult rest;
-        rest.ok=true;rest.user=result.user;rest.user.slot=2;
+        rest.ok=true;rest.user=result.user;rest.user.id="synthetic-private-id";
         auto command=[&](bool managed=true, bool applied=true, QString operation="disarm") {
             return AlarmUsers::restEvent(managed,rest,"1",operation,"synthetic-rest-event",1700000000000,applied);
         };
@@ -99,3 +98,4 @@ int main()
         return 1;
     }
 }
+

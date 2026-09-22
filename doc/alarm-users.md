@@ -1,245 +1,154 @@
-# Managed alarm users, schedules and optional keypad lockout
+# Gateway users and alarm access grants
 
-This feature extends IAS ACE alarm authentication. It does not operate doors,
-locks or other actuators. Consumers decide what to do with access decisions.
-All examples use synthetic values and an authenticated deCONZ API key.
+This opt-in feature separates gateway-wide identities and PINs from per-alarm
+access policy. Existing upstream installations that never enroll an alarm keep
+legacy `code0` behavior. Listing users does not enroll an alarm. The first grant
+must establish an enabled, unrestricted owner; enrollment and that grant commit
+in one transaction. Adding an alarm does not create any user grants.
 
-## Compatibility and activation
+This replaces the earlier experimental alarm-scoped slot API and schema. There
+is no runtime compatibility mode for that experiment. An unconverted experimental
+managed database fails closed rather than falling back to legacy PIN validation.
+Existing experimental data requires an offline, backed-up conversion before
+installing this runtime. Never infer shared identity from equal names or PINs.
 
-Existing single-code installations retain their legacy authentication and sensor
-events. Installing this build, reading capabilities, or listing users does not
-activate managed users. The first successful user PUT or DELETE activates managed
-mode for that alarm atomically. There is currently no API to revert to legacy mode.
+## Identity and grants
 
-`GET /api/<key>/alarmsystems/<alarm>/users/capabilities` reports `managed`,
-`max_users` (9), `api_arm_disarm`, `schedules`, `schedule_version` (1),
-`protected_primary_slot` (0), `access_event_version` (1),
-`rejected_access_events` and `keypad_lockout_version` (1).
+A gateway identity has an immutable random `id`, display `name`, `enabled` flag,
+one salted PIN hash, and `user_revision`. It has no implicit access to any alarm.
+Changing its PIN, name or enabled flag affects every grant of that identity.
+PINs are 4–16 ASCII digits; leading zeros are significant. PINs and hashes are
+never returned by this API or included in access events.
 
-Keypad lockout is a separate opt-in, **disabled by default even after enabling
-managed users**. Enabling it requires managed mode. Its settings do not change
-existing user permissions or schedules.
+Each alarm grant has its own `revision` and these fields:
 
-## User API
-
-The base path below is `/api/<key>/alarmsystems/<alarm>/users`.
-
-| Request | Purpose |
+| Field | Meaning / default |
 | --- | --- |
-| GET base | Object keyed by slot, containing users without PINs or hashes |
-| GET base/0 through base/8 | Read one user |
-| PUT base/slot | Create with revision 0, or edit with the current revision |
-| DELETE base/slot | Delete with JSON body `{"revision": <current>}` |
+| `grant_enabled` | Enable this grant; defaults to true |
+| `owner` | Owner role for this alarm; defaults to false |
+| `arm`, `disarm` | Allowed operations across its permitted routes; default true |
+| `api_arm_disarm` | Permit authenticated REST commands using this PIN; default false |
+| `all_keypads` | Permit all keypads assigned to this alarm, including future assignments; default false |
+| `keypads` | Array of `{source, endpoint}` restrictions; default empty |
+| `remaining_uses` | Shared allowance across the grant's keypads; null means unlimited |
+| `schedule` | Existing schedule-v1 object, or null for unrestricted time |
 
-A user has a stable opaque `id`, `slot`, `name`, `enabled`, `remaining_uses`,
-`api_arm_disarm`, `schedule` and `revision`. Returned identities are not names.
-Slot 0 is the protected primary user, regardless of its editable name. It cannot
-be deleted, disabled, scheduled, usage-limited, or denied REST arm/disarm access.
-Its name and PIN can be changed. Integrations caching its PIN must coordinate
-credential rotation themselves; deCONZ does not update external applications.
+An empty `keypads` list with `all_keypads:false` permits no physical keypad.
+A service identity can therefore have REST access without physical access.
+`all_keypads:true` requires an empty explicit list. Explicit sources use canonical
+lowercase, unpadded hexadecimal IEEE addresses and endpoints 1–240. The existing
+alarm/device association check still applies: a grant never assigns a device to
+an alarm. Restrictions cannot bypass that check.
 
-To explicitly activate management while retaining an existing primary PIN, GET
-slot 0 and PUT its current revision and unrestricted fields, omitting `pin`:
+Every enrolled alarm must retain at least one enabled identity with an enabled
+owner grant, arm and disarm permission, REST access, unlimited uses and no
+schedule/expiry. Owners may have selected physical keypads or no physical access.
+Protection depends on the role and the remaining owners, not a slot, name or
+special immutable owner ID. Create another owner before removing the last one.
 
-```json
-{"revision":1,"name":"Main","enabled":true,"remaining_uses":null,"api_arm_disarm":true,"schedule":null}
-```
+PIN uniqueness is per alarm, including disabled identities and disabled grants.
+Different identities can share a PIN only when their alarm sets do not overlap.
+Adding a grant and rotating a PIN check the complete affected set atomically.
+An existing identity's current PIN is required when adding a new grant because
+salted hashes cannot be compared directly for PIN equality. That operation
+verifies the supplied PIN; it does not rotate it.
 
-Create a secondary user in an unused slot using a string PIN (including leading
-zeroes). **Do not use this example PIN on a real system.**
+## API
 
-```json
-{"revision":0,"name":"Example visitor","pin":"012345","enabled":true,"remaining_uses":5,"api_arm_disarm":false,"schedule":null}
-```
+All routes below are beneath `/api/<apikey>` and require ordinary authenticated
+REST access. The API key is still an administrative credential; a user PIN is
+not an API authentication token or a separate admin role.
 
-PINs must be 4–16 ASCII digits and distinct across slots. Omitting `pin` preserves
-an existing credential. Names are at most 64 UTF-8 bytes without control
-characters. `remaining_uses:null` means unlimited; 0 means exhausted; finite
-values range from 0 through 1,000,000. Guest REST permission defaults to false.
-
-Only accepted physical keypad **disarm** consumes a finite use, including when
-already disarmed. Keypad arming and REST authentication do not consume uses.
-There is no refund based on a downstream actuator outcome. Accepted keypad
-requests update the user's revision, so clients must refetch after conflicts.
-REST arm/disarm requires a valid eligible code plus `api_arm_disarm:true`.
-Keypad access is independent of that REST permission.
-
-For REST arming/disarming, PUT `/api/<key>/alarmsystems/<alarm>/disarm`,
-`/arm_stay`, `/arm_night`, or `/arm_away` with `{"code0":"012345"}` (synthetic
-example only). The legacy field name remains `code0`, but managed mode checks all
-eligible API-enabled users, not just slot 0. This is an actual alarm command;
-do not call it merely to check whether a PIN is valid.
-
-User/lockout routes return JSON objects on success and deCONZ error arrays on
-failure. Inspect both HTTP status and error descriptions. Invalid fields or stale
-revisions normally yield HTTP 400; storage failures yield HTTP 503. Refetch after
-`revision_conflict`; never blindly retry a stale update. Relevant descriptions
-include `primary_user_protected`, `pin_already_assigned`, `invalid_schedule`,
-`invalid_lockout_policy` and `managed_users_required`. Transport errors leave the
-mutation result uncertain: read back before deciding whether to retry.
-
-## Schedules
-
-Set `schedule:null` to remove all time restrictions. Otherwise send all four keys:
-
-```json
-{
-  "timezone":"Europe/Berlin",
-  "not_before":null,
-  "expires_at":null,
-  "windows":[{"day":1,"start":540,"end":1020}]
-}
-```
-
-Weekdays are Monday=1 through Sunday=7. Times are local minutes since midnight;
-start is inclusive, end exclusive, and 1440 is allowed as an end. Split overnight
-windows at midnight. At most 28 windows are accepted. An empty list imposes no
-weekly restriction, allowing expiry-only policies. Bounds are UTC Unix
-milliseconds (or null), inclusive `not_before`, exclusive `expires_at`, between
-2020-01-01 and 2100-01-01. If both exist, start must precede end.
-
-The timezone must be available to Qt. Evaluation follows local wall time: skipped
-DST minutes do not occur; repeated minutes may qualify twice. Invalid policy or
-clock evaluation fails closed as not-ready, not as an invalid-code decision.
-Schedules are evaluated at authorization time; no timer rewrites enabled flags.
-
-## Optional brute-force protection
-
-`GET base/lockout` returns a `policy` object and `keypads` status array.
-`PUT base/lockout` replaces the complete policy with an optimistic revision check:
-
-```json
-{
-  "enabled":true,
-  "threshold":3,
-  "window_seconds":60,
-  "durations_seconds":[60,1200,3600],
-  "reset_seconds":86400,
-  "revision":0
-}
-```
-
-| Field | Range / behavior |
+| Route | Methods |
 | --- | --- |
-| enabled | Boolean; false by default, independent of managed-user activation |
-| threshold | 1–100 distinct wrong-PIN submissions |
-| window_seconds | 1–3,600; rolling window, excluding its oldest boundary |
-| durations_seconds | Exactly three nondecreasing integer durations, each 1–3,600 seconds |
-| reset_seconds | 3,600–604,800; quiet interval before escalation returns to level 1 |
-| revision | Required current policy revision; 0 when no policy has been saved |
+| `/alarmsystems/users` | GET global identities; POST a new identity without grants |
+| `/alarmsystems/users/<uid>` | GET / PUT identity; DELETE only after all grants are removed |
+| `/alarmsystems/<alarm>/users` | GET identity/grant projections; POST new identity plus its first grant |
+| `/alarmsystems/<alarm>/users/<uid>` | GET / PUT grant projection; DELETE this alarm grant only |
+| `/alarmsystems/<alarm>/users/capabilities` | GET capability and managed-state flags |
+| `/alarmsystems/<alarm>/users/lockout` | GET / PUT policy; DELETE explicit reset |
 
-Defaults are 3 failures within 60 seconds, then 60, 1,200 and 3,600 seconds, with
-an 86,400-second quiet reset. Subsequent qualifying bursts repeat level 3.
-Settings, deadlines, escalation and counted failures persist in SQLite.
-Enforcement is per alarm, source IEEE address and endpoint, not per guessed user.
-Failures across valid IAS arm/disarm modes share the same counter for that keypad.
+Collections are objects keyed by immutable UID. No numeric user slots exist.
+The capability response includes `global_users_version:2`, `per_alarm_grants:true`,
+`max_users:256`, schedule-v1, access-event-v1, keypad-lockout-v1,
+`rest_command_events:true` and `alarm_timing_version:1`.
 
-Only PINs matching no stored user count. Recognized but disabled, exhausted or
-out-of-schedule users are rejected without counting as guesses. Outside lockout,
-a recognized PIN clears the consecutive-failure counter; it does not immediately
-reset escalation. The quiet interval is measured from the last counted wrong PIN
-and evaluated on the next request. Radio retries do not count again.
+Every write includes both `revision` and `user_revision`. For a new identity both
+are zero. For a new grant, `revision` is zero and `user_revision` is the existing
+identity's current revision. For global identity writes both equal its current
+identity revision. Grant edits compare both revisions, so a concurrent identity
+change or use consumption cannot be overwritten by stale policy edits.
 
-The threshold-crossing request starts the next lockout. During it, **all keypad
-PINs, including the primary PIN**, receive an invalid-code response. Submitted
-credentials are not evaluated while blocked. No alarm
-state changes, accepted access events, or usage consumption occur. Attempts do
-not extend the deadline, count failures, or advance escalation. After expiry a
-new burst is required. REST authentication remains separate and unaffected; this
-is not protection against guessing through REST or abuse of an authorized API key.
+PUT merges omitted fields with current metadata. `pin`, when supplied, must be a
+nonempty string. A grant PUT may update global identity fields atomically with the
+grant; clients must make the cross-alarm scope clear. Identity revisions advance
+when identity fields change; grant revisions advance on grant writes and accepted
+physical access. DELETE accepts only the two revision fields. Unknown fields,
+nonintegral revisions, invalid schedules and ambiguous identities are rejected.
 
-Changing an enabled policy preserves an active deadline. Explicitly disabling
-protection clears its counters and state. A backward wall clock relative to a
-recorded failure fails closed; operators should correct the clock or explicitly
-reset. Expiry uses the gateway wall clock, so trustworthy system time matters.
+Example new owner enrollment (synthetic PIN; send credentials in the body only):
 
-Each status row has `source`, `endpoint`, stored `level`, `locked_until` (Unix
-milliseconds), and `remaining_seconds`. A stored level may remain nonzero after
-expiry until the next request applies quiet-time reset. These are administrative
-fields; clients should avoid displaying device identifiers unnecessarily.
+```json
+{"revision":0,"user_revision":0,"name":"Owner","enabled":true,"pin":"1357",
+ "owner":true,"api_arm_disarm":true,"all_keypads":false,"keypads":[],
+ "remaining_uses":null,"schedule":null}
+```
 
-To immediately clear **all keypad lockouts, failure counters and escalation for
-this alarm**, send `DELETE base/lockout` with `{"reset":true}`. The policy remains
-enabled. Reset does not validate a PIN, arm/disarm, or issue actuator commands.
-All routes require normal deCONZ API authentication. There is no separate owner
-role or extra per-key administrator permission in this feature. Restrict API-key
-possession; applications should add their own authenticated session and CSRF checks.
+Example attaching an existing global identity to another alarm:
 
-## Events and downstream behavior
+```json
+{"revision":0,"user_revision":3,"pin":"2468","arm":false,"disarm":true,
+ "api_arm_disarm":false,"all_keypads":false,"keypads":[{"source":"abc","endpoint":1}],
+ "remaining_uses":5,"schedule":null}
+```
 
-Managed decisions produce WebSocket events with `t:"event"`, `e:"access"`,
-`r:"alarmsystems"`, alarm `id`, `sensor_id`, opaque `event_id`, UTC `timestamp`,
-`result`, `action`, and `uses_consumed`. Accepted decisions also carry `user_id`,
-`user_slot`, and `remaining_uses`. Rejected decisions omit user identity, names,
-remaining counts and credentials, including when a known user is ineligible.
+Managed alarms reject legacy config `code0` writes, which cannot unambiguously
+select a global identity. Use the UID-based, revision-checked API. Existing REST
+arm/disarm commands retain their route and `{"code0":"..."}` body, so clients
+using a saved PIN do not need a package update. Legacy unmanaged config/commands
+keep their upstream behavior.
 
-During lockout (including the threshold-crossing request), a rejected event adds
-`lockout:true`, `locked_until` and `lockout_level`. Its action remains
-`invalid_code` for compatibility. **Consumers interpreting rejection as a
-close-only request can retain that behavior during lockout**, subject to their own
-motion guards. This plugin makes no inference about actuator movement or success.
+## Authorization and events
 
-Legacy sensor actions/timestamps remain available. For activity counting, use
-immutable access `event_id`, not mutable sensor snapshots. The same request
-sequence from a keypad within the 10-second duplicate window reuses its receipt
-and emits no new access event, sensor action, alarm write or use consumption.
-An active lockout overrides a cached acceptance with rejection without replaying
-its effects. That duplicate window is not a brute-force cooldown. Distinct sequence numbers
-represent distinct requests. A sequence collision with different mode or matched
-identity fails closed. Storage errors return not-ready and emit no access decision.
+Only an accepted physical keypad DISARM consumes one use, including an already-disarmed acceptance. ARM and REST do not consume uses. Schedules, global enabled
+state, grant enabled state, remaining allowance and operation permissions apply
+at authorization. A grant's allowance and schedule are shared across its allowed
+keypads and independent of every other alarm grant.
 
-## Implementation and review
+SQLite transactions serialize edits and final-use admission. Duplicate physical
+requests within the existing ten-second window retain their original receipt
+and do not consume another use. Duplicate receipts and lockout state survive
+restart. Storage/schedule errors produce not-ready, never a false invalid-code
+access decision. Rejected access never exposes a matched ineligible identity.
 
-Schema additions are isolated `*_v1` tables; upstream tables/user_version are not
-redefined. The primary hash continues to mirror into legacy secrets. Authorization,
-counting, lockout and request receipt commit together before success. Credentials
-use the gateway's existing scrypt helpers and never appear in user/event responses.
+Accepted access and REST events carry immutable `user_id` without `user_slot`.
+`access` events remain physical-keypad decisions. `alarm_command` remains a
+separate REST event with an operation and accepted/rejected/failed outcome;
+it must not be routed as physical keypad input. REST events consume no use and
+do not participate in keypad lockout. They identify the credential, not the
+human or automation using a third-party client. Accepted commands do not prove
+an exit delay completed or any physical output operated. No event replay is
+provided across connection gaps.
 
-Regression coverage includes legacy opt-in boundaries, protected primary policy,
-PIN rotation and uniqueness, finite uses, REST permissions, schedules/DST,
-duplicate receipts, concurrent authorization, rejected-event privacy, rolling
-failure windows, escalation/cap, per-keypad isolation, administrative reset,
-SQLite reopen persistence, and storage failure. Full Qt plugin builds run in CI.
-Physical keypad firmware, Zigbee delivery, and downstream actuator operation still
-require integration testing; unit tests do not establish physical outcomes.
+## Lockout, schedules and timing
 
-## REST alarm command activity
+Optional failed-PIN lockout remains scoped to alarm + physical source + endpoint.
+A wrong PIN cannot identify a user. Default policy is disabled, threshold 3 in
+60 seconds, durations `[60,1200,3600]`, quiet reset 86400 seconds. Durations must
+be ascending, 1–3600 seconds; threshold 1–100, window 1–3600, reset 3600–604800.
+PUT includes all policy fields and its revision. DELETE requires `{"reset":true}`.
+Active deadlines are preserved by enabled-policy edits. Disabling or explicit
+reset clears active locks and escalation. Locked attempts do not evaluate PINs
+or extend the deadline. Known but ineligible PINs are rejected without counting
+as unidentified wrong PINs. REST remains independent of physical lockout.
 
-Managed alarms additionally advertise `rest_command_events:true` and emit a separate
-WebSocket `e:"alarm_command"` event for each evaluated REST arm/disarm request.
-Legacy alarms do not emit these events. Installing the plugin does not enable managed mode.
-The payload contains `t:"event"`, `r:"alarmsystems"`, alarm `id`, `source:"rest"`,
-a unique 32-hex `event_id`, UTC `timestamp`, `action` (`disarm`, `arm_stay`,
-`arm_night`, `arm_away`), `result` (`accepted`, `rejected`, `failed`) and
-`uses_consumed:0`. Accepted authentication includes immutable `user_id` and
-`user_slot`; rejected authentication never exposes a matched ineligible user.
-`failed` means credentials were accepted but applying the target mode failed.
-Storage/schedule-evaluation errors return an error without inventing a rejection event.
-Malformed requests are not credential attempts and emit no command event.
+Schedules use version 1, an IANA `timezone`, UTC epoch-millisecond `not_before`/`expires_at` values
+or null, and weekly `windows` with ISO weekday 1–7 and start/end minute values.
+End boundaries are exclusive; split overnight windows. Empty windows impose no
+weekly restriction. Production validation and timezone/DST behavior are shared
+with the existing schedule implementation; malformed policies fail closed.
 
-An accepted request means deCONZ accepted the target mode; it does not mean an
-exit delay finished or a physical alarm output operated. Observe alarm state
-separately. A repeated request, even for the current mode, is a separate command
-with a new ID. Delivery is live, not a replayable audit journal. Consumers should
-deduplicate by event ID. Do not send these events to keypad/door activation logic.
-No PIN, PIN hash, API key, client address or request body is included.
-The identity is the credential used, not the human behind an app or automation.
-REST requests do not consume use allowances or enter the keypad lockout counter.
-
-## Alarm timing configuration
-
-`alarm_timing_version:1` advertises correct independent Stay/Night/Away trigger
-duration selection. Earlier code selected the exit-delay resource for Stay and
-Night trigger durations; those modes now use their configured trigger durations.
-Review existing values when upgrading because differing values change behavior.
-
-GET `/api/<key>/alarmsystems/<alarm>` returns current `state`, target `config.armmode`
-and timing configuration. PUT `/api/<key>/alarmsystems/<alarm>/config` accepts
-`armed_stay_entry_delay`, `armed_stay_exit_delay`, `armed_stay_trigger_duration`,
-and the equivalent `armed_night_*` and `armed_away_*` keys. Values are whole seconds,
-0–255. Entry delay is the opportunity to disarm after a triggering sensor; exit delay
-is the time before the requested mode takes effect; trigger duration is the period
-in the triggered state, not a guarantee of siren operation. Zero removes that interval.
-Timing changes should be made while disarmed and read back before the next arming.
-The existing config API is not a compare-and-swap or atomic batch API; clients must
-validate complete payloads, handle partial/unknown outcomes and reread on failure.
+Alarm timing configuration remains `armed_stay_*`, `armed_night_*`, and
+`armed_away_*` with `entry_delay`, `exit_delay`, and `trigger_duration` suffixes.
+Values are whole seconds 0–255. Configure while disarmed and read back values;
+this upstream configuration API is not an atomic compare-and-swap batch API.

@@ -50,6 +50,8 @@
 #define AS_ARM_MASK_ARMED_STAY  0x0200
 #define AS_ARM_MASK_ARMED_NIGHT 0x0400
 
+AlarmUsers::Store AS_UserStore();
+
 class Event;
 class EventEmitter;
 class AS_DeviceTable;
@@ -77,7 +79,7 @@ public:
     ~AlarmSystem();
     void handleEvent(const Event &event);
     void didSetValue(ResourceItem *i) override;
-    AlarmUsers::RestResult authorizeRest(const QString &code);
+    AlarmUsers::RestResult authorizeRest(const QString &code, int mode);
     bool isValidCode(const QString &code, quint64 srcExtAddress);
     bool lockout(AlarmUsers::LockoutPolicy &policy, std::vector<AlarmUsers::LockoutState> &states);
     bool configureLockout(AlarmUsers::LockoutPolicy &policy, qint64 revision, std::string &error);
@@ -85,7 +87,6 @@ public:
     bool users(std::vector<AlarmUsers::User> &out);
     bool userManagementEnabled(bool &enabled);
     bool putUser(AlarmUsers::User &user, const QString &pin, qint64 revision, std::string &error);
-    bool deleteUser(int slot, qint64 revision);
     AlarmUsers::Result authorizeKeypad(const QString &code, quint64 source, int endpoint,
                                       int sequence, int mode, qint64 nowMs);
     AlarmSystemId id() const;
@@ -134,4 +135,5 @@ const AlarmSystem *AS_GetAlarmSystem(AlarmSystemId alarmSystemId, const AlarmSys
 AlarmSystem *AS_GetAlarmSystem(AlarmSystemId alarmSystemId, AlarmSystems &alarmSystems);
 
 #endif // ALARM_SYSTEM_H
+
 

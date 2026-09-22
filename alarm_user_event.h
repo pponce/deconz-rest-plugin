@@ -14,7 +14,7 @@ inline QVariantMap accessEvent(bool managed, const Result &result, const QString
     const bool rejected = result.response == 4;
     const bool accepted = (result.response >= 0 && result.response <= 3) || result.response == 6;
     if (!managed || !result.ok || result.duplicate || result.eventId.empty() ||
-        (!rejected && !accepted) || (!rejected && result.user.slot < 0)) return event;
+        (!rejected && !accepted) || (!rejected && result.user.id.empty())) return event;
 
     static const char *actions[] = {"disarmed", "armed_stay", "armed_night", "armed_away",
                                    "invalid_code", "not_ready", "already_disarmed"};
@@ -36,7 +36,6 @@ inline QVariantMap accessEvent(bool managed, const Result &result, const QString
     if (!rejected)
     {
         event[QLatin1String("user_id")] = QString::fromStdString(result.user.id);
-        event[QLatin1String("user_slot")] = result.user.slot;
         event[QLatin1String("remaining_uses")] = result.user.remaining < 0
             ? QVariant() : QVariant(qlonglong(result.user.remaining));
     }
@@ -49,7 +48,7 @@ inline QVariantMap restEvent(bool managed, const RestResult &result, const QStri
                              bool applied)
 {
     if (!managed || !result.ok || eventId.isEmpty() ||
-        (result.accepted && result.user.slot < 0) ||
+        (result.accepted && result.user.id.empty()) ||
         (operation != "disarm" && operation != "arm_stay" &&
          operation != "arm_night" && operation != "arm_away")) return {};
     QVariantMap event;
@@ -65,10 +64,10 @@ inline QVariantMap restEvent(bool managed, const RestResult &result, const QStri
     event["uses_consumed"] = 0;
     if (result.accepted) {
         event["user_id"] = QString::fromStdString(result.user.id);
-        event["user_slot"] = result.user.slot;
     }
     return event;
 }
 
 }
 #endif
+

@@ -447,22 +447,22 @@ void AlarmSystem::didSetValue(ResourceItem *i)
     The verification is only done if an entry for \p srcExtAddress exists
     in the alarm system device table.
  */
-static AlarmUsers::Store userStore()
+AlarmUsers::Store AS_UserStore()
 {
     return AlarmUsers::Store(DB_AlarmUserConnection(), CRYPTO_ScryptVerify,
         [](const std::string &pin) { return CRYPTO_ScryptPassword(pin, CRYPTO_GenerateSalt()); }, AlarmUsers::checkSchedule);
 }
 
-AlarmUsers::RestResult AlarmSystem::authorizeRest(const QString &code)
+AlarmUsers::RestResult AlarmSystem::authorizeRest(const QString &code, int mode)
 {
-    return userStore().authorizeRest(id(), code.toStdString());
+    return AS_UserStore().authorizeRest(id(), code.toStdString(), -1, mode);
 }
 
 bool AlarmSystem::isValidCode(const QString &code, quint64 srcExtAddress)
 {
     bool managed = false;
     if (!userManagementEnabled(managed)) return false;
-    if (managed) return srcExtAddress == 0 && userStore().restCode(id(), code.toStdString());
+    if (managed) return srcExtAddress == 0 && AS_UserStore().restCode(id(), code.toStdString());
     if (srcExtAddress != 0)
     {
         const AS_DeviceEntry &entry = d->devTable->get(srcExtAddress);
@@ -489,35 +489,25 @@ bool AlarmSystem::isValidCode(const QString &code, quint64 srcExtAddress)
 
 bool AlarmSystem::userManagementEnabled(bool &enabled)
 {
-    return userStore().managementEnabled(id(), enabled);
+    return AS_UserStore().managementEnabled(id(), enabled);
 }
 
 bool AlarmSystem::lockout(AlarmUsers::LockoutPolicy &p, std::vector<AlarmUsers::LockoutState> &states) {
-    return userStore().lockout(id(),p,states);
+    return AS_UserStore().lockout(id(),p,states);
 }
 bool AlarmSystem::configureLockout(AlarmUsers::LockoutPolicy &p,qint64 revision,std::string &error) {
-    return userStore().configureLockout(id(),p,revision,error);
+    return AS_UserStore().configureLockout(id(),p,revision,error);
 }
-bool AlarmSystem::resetLockout() { return userStore().resetLockout(id()); }
+bool AlarmSystem::resetLockout() { return AS_UserStore().resetLockout(id()); }
 bool AlarmSystem::users(std::vector<AlarmUsers::User> &out)
 {
-    return userStore().list(id(), out);
+    return AS_UserStore().list(id(), out);
 }
 
 bool AlarmSystem::putUser(AlarmUsers::User &user, const QString &pin, qint64 revision, std::string &error)
 {
-    const bool ok = userStore().put(id(), user, pin.toStdString(), revision, error);
+    const bool ok = AS_UserStore().put(id(), user, pin.toStdString(), revision, error);
     if (ok) setValue(RConfigConfigured, true);
-    return ok;
-}
-
-bool AlarmSystem::deleteUser(int slot, qint64 revision)
-{
-    const bool ok = userStore().erase(id(), slot, revision);
-    if (ok) {
-        std::vector<AlarmUsers::User> remaining;
-        if (users(remaining)) setValue(RConfigConfigured, !remaining.empty());
-    }
     return ok;
 }
 
@@ -531,7 +521,7 @@ AlarmUsers::Result AlarmSystem::authorizeKeypad(const QString &code, quint64 sou
         denied.response = 4;
         return denied;
     }
-    return userStore().authorize(id(), QString::number(source, 16).toStdString(), endpoint,
+    return AS_UserStore().authorize(id(), QString::number(source, 16).toStdString(), endpoint,
                                 sequence, mode, code.toStdString(), nowMs,
                                 targetArmMode() == AS_ArmModeDisarmed);
 }
@@ -625,11 +615,9 @@ bool AlarmSystem::setCode(int index, const QString &code)
 {
     bool managed = false;
     if (!userManagementEnabled(managed)) return false;
-    if (managed) {
-        if (index != 0 || !userStore().setMainCode(id(), code.toStdString())) return false;
-        setValue(RConfigConfigured, true);
-        return true;
-    }
+    // Managed credentials have global identity and require revision-checked writes.
+    // The legacy code0 configuration setter cannot select that identity safely.
+    if (managed) return false;
     if (code.isEmpty())
     {
         return false;
@@ -842,6 +830,7 @@ void AS_InitDefaultAlarmSystem(AlarmSystems &alarmSystems, AS_DeviceTable *devTa
 
     alarmSys->setValue(RAttrName, QString("default"));
 }
+
 
 
 
