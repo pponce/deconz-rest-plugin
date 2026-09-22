@@ -72,7 +72,7 @@ static void schedulePolicyTests() {
     sql(db,"DROP TRIGGER deny_schedule");
     user=get(store,1);CHECK(store.erase(1,1,user.revision));
     auto replacement=add(store,1,"2468");CHECK(replacement.schedule.empty());
-    // Slot 0 is not a backend privilege exception: UI protects its Homebridge role separately.
+    // Slot 0 follows the same schedule restrictions, including after a legacy PIN update.
     auto main=add(store,0,"1357");main.schedule="window";main.apiArmDisarm=true;CHECK(store.put(1,main,"",main.revision,err));
     CHECK(!store.restCode(1,"1357",130000));CHECK(store.setMainCode(1,"1358"));
     CHECK(get(store,0).schedule=="window" && !store.restCode(1,"1358",130000));
