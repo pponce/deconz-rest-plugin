@@ -288,25 +288,6 @@ Result Store::authorize(int alarm,const std::string &source,int endpoint,int seq
         mode<0 || mode>3 || now<=DuplicateWindowMs) return result;
     Transaction t(db); std::vector<User> users;
     if (!t.active || !init(alarm) || !read(alarm,users)) return result;
-    // Match disabled/exhausted users too, so retries of the final use can be recognized.
-    User matched;
-    for (const auto &u:users) if (verify(u.hash,pin)) { matched=u; break; }
-    Statement previous(db,"SELECT mode,created,uid,response,eventid FROM alarm_user_requests_v1 "
-        "WHERE alarm=? AND source=? AND endpoint=? AND sequence=?");
-    if (!previous.valid()) return result;
-    previous.number(1,alarm); previous.text(2,source); previous.number(3,endpoint); previous.number(4,sequence);
-    int rc=previous.step();
-    if (rc==SQLITE_ROW) {
-        const auto age=now-previous.number(1);
-        if (age<0) return result; // clock moved backward: never re-admit uncertain receipt
-        if (age<=DuplicateWindowMs) {
-            if (previous.number(0)!=mode || previous.text(2)!=matched.id) return result;
-            result.response=int(previous.number(3)); result.eventId=previous.text(4);
-            result.user=matched; result.duplicate=true; result.ok=t.commit(); return result;
-        }
-    } else if (rc!=SQLITE_DONE) return result;
-    previous.step(); // finish read before writes/commit
-    result.response=4;
     LockoutPolicy policy;
     if (!readPolicy(db,alarm,policy)) return result;
     LockoutState state;state.source=source;state.endpoint=endpoint;
@@ -318,8 +299,31 @@ Result Store::authorize(int alarm,const std::string &source,int endpoint,int seq
             state.level=int(q.number(0));state.until=q.number(1);state.lastFailure=q.number(2);
             if(state.level<0||state.level>3||state.until<0||state.lastFailure>now)return Result{};
         } else if(found!=SQLITE_DONE)return Result{};
+        result.locked=state.until>now;
+    }
+    // Match disabled/exhausted users too, so retries of the final use can be recognized.
+    User matched;
+    // During lockout do not evaluate the submitted credential at all.
+    if (!result.locked) for (const auto &u:users) if (verify(u.hash,pin)) { matched=u; break; }
+    Statement previous(db,"SELECT mode,created,uid,response,eventid FROM alarm_user_requests_v1 "
+        "WHERE alarm=? AND source=? AND endpoint=? AND sequence=?");
+    if (!previous.valid()) return result;
+    previous.number(1,alarm); previous.text(2,source); previous.number(3,endpoint); previous.number(4,sequence);
+    int rc=previous.step();
+    if (rc==SQLITE_ROW) {
+        const auto age=now-previous.number(1);
+        if (age<0) return result; // clock moved backward: never re-admit uncertain receipt
+        if (age<=DuplicateWindowMs) {
+            if (previous.number(0)!=mode || (!result.locked && previous.text(2)!=matched.id)) return result;
+            result.response=result.locked ? 4 : int(previous.number(3)); result.eventId=previous.text(4);
+            result.user=matched; result.duplicate=true; result.ok=t.commit(); return result;
+        }
+    } else if (rc!=SQLITE_DONE) return result;
+    previous.step(); // finish read before writes/commit
+    result.response=4;
+    if (policy.enabled) {
         if(state.until>now) {
-            result.locked=true; // No timer extension, hashing outcome or usage mutation.
+            result.locked=true; // No timer extension, credential check or usage mutation.
         } else {
             if(now-state.lastFailure>=int64_t(policy.resetSeconds)*1000)state.level=0;
             if(matched.slot<0) {

@@ -76,6 +76,8 @@ static void lockoutTests() {
     auto dup=s.authorize(1,"pad",1,10,0,"9999",now,true);CHECK(dup.duplicate&&!dup.locked);
     CHECK(!enter("9999").locked);r=enter("9999");CHECK(r.locked&&r.lockoutLevel==1&&r.lockedUntil==260002);
     const auto until=r.lockedUntil;
+    Store noVerify(db,[](const std::string &,const std::string &)->bool {throw std::runtime_error("credential evaluated during lockout");},hash);
+    CHECK(noVerify.authorize(1,"pad",1,seq++,0,"1357",now++,true).locked);
     for(int mode=0;mode<4;++mode) {
         r=s.authorize(1,"pad",1,seq++,mode,"1357",now++,true);
         CHECK(r.ok&&r.response==4&&r.locked&&r.lockedUntil==until&&r.user.slot==-1);

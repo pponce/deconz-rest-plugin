@@ -127,7 +127,8 @@ reset escalation. The quiet interval is measured from the last counted wrong PIN
 and evaluated on the next request. Radio retries do not count again.
 
 The threshold-crossing request starts the next lockout. During it, **all keypad
-PINs, including the primary PIN**, receive an invalid-code response. No alarm
+PINs, including the primary PIN**, receive an invalid-code response. Submitted
+credentials are not evaluated while blocked. No alarm
 state changes, accepted access events, or usage consumption occur. Attempts do
 not extend the deadline, count failures, or advance escalation. After expiry a
 new burst is required. REST authentication remains separate and unaffected; this
@@ -168,7 +169,8 @@ Legacy sensor actions/timestamps remain available. For activity counting, use
 immutable access `event_id`, not mutable sensor snapshots. The same request
 sequence from a keypad within the 10-second duplicate window reuses its receipt
 and emits no new access event, sensor action, alarm write or use consumption.
-That duplicate window is not a brute-force cooldown. Distinct sequence numbers
+An active lockout overrides a cached acceptance with rejection without replaying
+its effects. That duplicate window is not a brute-force cooldown. Distinct sequence numbers
 represent distinct requests. A sequence collision with different mode or matched
 identity fails closed. Storage errors return not-ready and emit no access decision.
 
