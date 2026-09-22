@@ -77,6 +77,7 @@ public:
     ~AlarmSystem();
     void handleEvent(const Event &event);
     void didSetValue(ResourceItem *i) override;
+    AlarmUsers::RestResult authorizeRest(const QString &code);
     bool isValidCode(const QString &code, quint64 srcExtAddress);
     bool lockout(AlarmUsers::LockoutPolicy &policy, std::vector<AlarmUsers::LockoutState> &states);
     bool configureLockout(AlarmUsers::LockoutPolicy &policy, qint64 revision, std::string &error);

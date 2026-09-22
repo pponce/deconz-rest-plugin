@@ -284,8 +284,8 @@ void AlarmSystemPrivate::updateTargetStateValues()
     if (targetState > AS_ArmModeDisarmed)
     {
         const char* triggerSuffix[4] = { RInvalidSuffix,  // no trigger duration in disarmed state
-                                         RConfigArmedStayExitDelay,
-                                         RConfigArmedNightExitDelay,
+                                         RConfigArmedStayTriggerDuration,
+                                         RConfigArmedNightTriggerDuration,
                                          RConfigArmedAwayTriggerDuration };
 
         triggerDuration = q->item(triggerSuffix[targetState])->toNumber();
@@ -451,6 +451,11 @@ static AlarmUsers::Store userStore()
 {
     return AlarmUsers::Store(DB_AlarmUserConnection(), CRYPTO_ScryptVerify,
         [](const std::string &pin) { return CRYPTO_ScryptPassword(pin, CRYPTO_GenerateSalt()); }, AlarmUsers::checkSchedule);
+}
+
+AlarmUsers::RestResult AlarmSystem::authorizeRest(const QString &code)
+{
+    return userStore().authorizeRest(id(), code.toStdString());
 }
 
 bool AlarmSystem::isValidCode(const QString &code, quint64 srcExtAddress)

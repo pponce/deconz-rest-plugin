@@ -1,4 +1,7 @@
 #include "alarm_user_schedule.h"
+#include "alarm_user_event.h"
+#include <QUuid>
+#include "websocket_server.h"
 /*
  * Copyright (c) 2021 dresden elektronik ingenieurtechnik gmbh.
  * All rights reserved.
@@ -216,6 +219,8 @@ static int handleAlarmUsers(const ApiRequest &req, ApiResponse &rsp, AlarmSystem
         rsp.map[QLatin1String("schedule_version")] = 1;
         rsp.map[QLatin1String("protected_primary_slot")] = 0;
         rsp.map[QLatin1String("access_event_version")] = 1;
+        rsp.map[QLatin1String("rest_command_events")] = true;
+        rsp.map[QLatin1String("alarm_timing_version")] = 1;
         rsp.map[QLatin1String("rejected_access_events")] = true;
         rsp.map[QLatin1String("keypad_lockout_version")] = 1;
         rsp.map[QLatin1String("max_users")] = AlarmUsers::MaxUsers;
@@ -659,13 +664,6 @@ static int putAlarmSystemArmMode(const ApiRequest &req, ApiResponse &rsp, AlarmS
 
     const QString code0 = map.value(QLatin1String("code0")).toString();
 
-    if (!alarmSys->isValidCode(code0, 0))
-    {
-        rsp.list.append(errInvalidValue(id, "attr/code0", QLatin1String("[redacted]"))); // use attr/ since this gets stripped away
-        rsp.httpStatus = HttpStatusBadRequest;
-        return REQ_READY_SEND;
-    }
-
     AS_ArmMode mode = AS_ArmModeMax;
 
     const QLatin1String op = req.hdr.pathAt(4);
@@ -679,7 +677,36 @@ static int putAlarmSystemArmMode(const ApiRequest &req, ApiResponse &rsp, AlarmS
         return REQ_READY_SEND;
     }
 
-    if (alarmSys->setTargetArmMode(mode))
+    bool managed = false;
+    if (!alarmSys->userManagementEnabled(managed)) {
+        rsp.list.append(errInternalError(id, QLatin1String("credential storage unavailable")));
+        rsp.httpStatus = HttpStatusServiceUnavailable;
+        return REQ_READY_SEND;
+    }
+    AlarmUsers::RestResult decision;
+    if (managed) decision = alarmSys->authorizeRest(code0);
+    else { decision.ok = true; decision.accepted = alarmSys->isValidCode(code0, 0); }
+    if (!decision.ok) {
+        rsp.list.append(errInternalError(id, QLatin1String("credential storage unavailable")));
+        rsp.httpStatus = HttpStatusServiceUnavailable;
+        return REQ_READY_SEND;
+    }
+    const auto publish = [&](bool applied) {
+        if (!managed || !plugin->webSocketServer) return;
+        const auto event = AlarmUsers::restEvent(managed, decision, alarmSys->idString(), QString(op),
+            QUuid::createUuid().toString(QUuid::WithoutBraces).remove('-'),
+            QDateTime::currentMSecsSinceEpoch(), applied);
+        if (!event.isEmpty()) plugin->webSocketServer->broadcastTextMessage(Json::serialize(event));
+    };
+    if (!decision.accepted) {
+        publish(false);
+        rsp.list.append(errInvalidValue(id, "attr/code0", QLatin1String("[redacted]")));
+        rsp.httpStatus = HttpStatusBadRequest;
+        return REQ_READY_SEND;
+    }
+    const bool applied = alarmSys->setTargetArmMode(mode);
+    publish(applied);
+    if (applied)
     {
         // success
         rsp.list.append(addSuccessEntry(id, RConfigArmMode, AS_ArmModeToString(mode)));

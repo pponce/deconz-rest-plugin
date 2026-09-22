@@ -189,6 +189,29 @@ static void schedulePolicyTests() {
     CHECK(get(store,0).schedule.empty() && store.restCode(1,"1358",130000));
     CHECK(sqlite3_close(db)==SQLITE_OK);
 }
+static void restAttributionTests() {
+    sqlite3 *db=nullptr;CHECK(sqlite3_open(":memory:",&db)==SQLITE_OK);
+    sql(db,"CREATE TABLE secrets(uniqueid TEXT PRIMARY KEY,secret TEXT,state INTEGER)");
+    Store store(db,verify,hash,[](const std::string &policy,int64_t now){return now==0?1:policy=="error"?-1:now<2000?1:0;});
+    add(store,0,"1357");auto guest=add(store,1,"2468",2);std::string error;
+    auto denied=store.authorizeRest(1,"2468",1000);
+    CHECK(denied.ok && !denied.accepted && denied.user.slot==-1);
+    guest.apiArmDisarm=true;guest.schedule="window";CHECK(store.put(1,guest,"",guest.revision,error));
+    auto accepted=store.authorizeRest(1,"2468",1000);
+    CHECK(accepted.ok && accepted.accepted && accepted.user.id==guest.id);
+    CHECK(get(store,1).remaining==2 && get(store,1).revision==guest.revision);
+    CHECK(store.authorizeRest(1,"2468",1000).accepted); // repeated REST calls are separate commands
+    CHECK(get(store,1).remaining==2);
+    denied=store.authorizeRest(1,"2468",2000);CHECK(denied.ok && !denied.accepted && denied.user.slot==-1);
+    denied=store.authorizeRest(1,"9999",1000);CHECK(denied.ok && !denied.accepted && denied.user.slot==-1);
+    guest.enabled=false;CHECK(store.put(1,guest,"",guest.revision,error));
+    denied=store.authorizeRest(1,"2468",1000);CHECK(denied.ok && !denied.accepted && denied.user.id.empty());
+    guest.enabled=true;guest.remaining=0;CHECK(store.put(1,guest,"",guest.revision,error));
+    CHECK(!store.authorizeRest(1,"2468",1000).accepted);
+    guest.remaining=2;guest.schedule="error";CHECK(store.put(1,guest,"",guest.revision,error));
+    CHECK(!store.authorizeRest(1,"2468",1000).ok);
+    CHECK(sqlite3_close(db)==SQLITE_OK);
+}
 static void apiPermissionTests() {
     const char *path="alarm-api-permission-test.sqlite"; std::remove(path);
     sqlite3 *db=nullptr; CHECK(sqlite3_open(path,&db)==SQLITE_OK);
@@ -379,6 +402,7 @@ int main() {
     CHECK(list(reopened).size()==9);
     CHECK(reopened.managementEnabled(1,managed) && managed); // Never silently fall back.
     CHECK(sqlite3_close(db)==SQLITE_OK);std::remove(path);
+    restAttributionTests();
     apiPermissionTests();
     schedulePolicyTests();
     primaryProtectionTests();

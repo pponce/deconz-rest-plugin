@@ -41,6 +41,11 @@ struct Result {
     User user;
     std::string eventId;
 };
+struct RestResult {
+    bool ok = false; // storage/schedule errors are not credential rejections
+    bool accepted = false;
+    User user; // populated only on acceptance; never serialized wholesale
+};
 using Verify = std::function<bool(const std::string &, const std::string &)>;
 using ScheduleCheck = std::function<int(const std::string &, int64_t)>; // -1 error, 0 denied, 1 allowed; now=0 validates
 using Hash = std::function<std::string(const std::string &)>;
@@ -61,6 +66,7 @@ public:
     bool put(int alarm, User &user, const std::string &pin, int64_t expectedRevision,
              std::string &error);
     bool erase(int alarm, int slot, int64_t expectedRevision);
+    RestResult authorizeRest(int alarm, const std::string &pin, int64_t nowMs = -1);
     bool restCode(int alarm, const std::string &pin, int64_t nowMs = -1); // API permission + eligibility; never consumes uses
     bool setMainCode(int alarm, const std::string &pin); // legacy config/code0
     Result authorize(int alarm, const std::string &source, int endpoint, int sequence,

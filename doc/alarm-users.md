@@ -202,3 +202,44 @@ failure windows, escalation/cap, per-keypad isolation, administrative reset,
 SQLite reopen persistence, and storage failure. Full Qt plugin builds run in CI.
 Physical keypad firmware, Zigbee delivery, and downstream actuator operation still
 require integration testing; unit tests do not establish physical outcomes.
+
+## REST alarm command activity
+
+Managed alarms additionally advertise `rest_command_events:true` and emit a separate
+WebSocket `e:"alarm_command"` event for each evaluated REST arm/disarm request.
+Legacy alarms do not emit these events. Installing the plugin does not enable managed mode.
+The payload contains `t:"event"`, `r:"alarmsystems"`, alarm `id`, `source:"rest"`,
+a unique 32-hex `event_id`, UTC `timestamp`, `action` (`disarm`, `arm_stay`,
+`arm_night`, `arm_away`), `result` (`accepted`, `rejected`, `failed`) and
+`uses_consumed:0`. Accepted authentication includes immutable `user_id` and
+`user_slot`; rejected authentication never exposes a matched ineligible user.
+`failed` means credentials were accepted but applying the target mode failed.
+Storage/schedule-evaluation errors return an error without inventing a rejection event.
+Malformed requests are not credential attempts and emit no command event.
+
+An accepted request means deCONZ accepted the target mode; it does not mean an
+exit delay finished or a physical alarm output operated. Observe alarm state
+separately. A repeated request, even for the current mode, is a separate command
+with a new ID. Delivery is live, not a replayable audit journal. Consumers should
+deduplicate by event ID. Do not send these events to keypad/door activation logic.
+No PIN, PIN hash, API key, client address or request body is included.
+The identity is the credential used, not the human behind an app or automation.
+REST requests do not consume use allowances or enter the keypad lockout counter.
+
+## Alarm timing configuration
+
+`alarm_timing_version:1` advertises correct independent Stay/Night/Away trigger
+duration selection. Earlier code selected the exit-delay resource for Stay and
+Night trigger durations; those modes now use their configured trigger durations.
+Review existing values when upgrading because differing values change behavior.
+
+GET `/api/<key>/alarmsystems/<alarm>` returns current `state`, target `config.armmode`
+and timing configuration. PUT `/api/<key>/alarmsystems/<alarm>/config` accepts
+`armed_stay_entry_delay`, `armed_stay_exit_delay`, `armed_stay_trigger_duration`,
+and the equivalent `armed_night_*` and `armed_away_*` keys. Values are whole seconds,
+0–255. Entry delay is the opportunity to disarm after a triggering sensor; exit delay
+is the time before the requested mode takes effect; trigger duration is the period
+in the triggered state, not a guarantee of siren operation. Zero removes that interval.
+Timing changes should be made while disarmed and read back before the next arming.
+The existing config API is not a compare-and-swap or atomic batch API; clients must
+validate complete payloads, handle partial/unknown outcomes and reread on failure.

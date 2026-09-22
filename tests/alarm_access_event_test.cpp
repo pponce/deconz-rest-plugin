@@ -69,6 +69,30 @@ int main()
         CHECK(event(false).isEmpty());
         result.eventId.clear();
         CHECK(event().isEmpty());
+        AlarmUsers::RestResult rest;
+        rest.ok=true;rest.user=result.user;rest.user.slot=2;
+        auto command=[&](bool managed=true, bool applied=true, QString operation="disarm") {
+            return AlarmUsers::restEvent(managed,rest,"1",operation,"synthetic-rest-event",1700000000000,applied);
+        };
+        CHECK(command(false).isEmpty());
+        CHECK(command()["result"]=="rejected");
+        CHECK(command()["e"]=="alarm_command");
+        CHECK(command()["source"]=="rest");
+        CHECK(!command().contains("user_id"));
+        CHECK(!command().contains("sensor_id"));
+        CHECK(!QJsonDocument::fromVariant(command()).toJson().contains("synthetic-private"));
+        rest.accepted=true;
+        for(const char *op:{"disarm","arm_stay","arm_night","arm_away"}) {
+            const auto request=command(true,true,op);
+            CHECK(request["result"]=="accepted");
+            CHECK(request["user_id"]=="synthetic-private-id");
+            CHECK(request["uses_consumed"].toInt()==0);
+            CHECK(!request.contains("remaining_uses"));
+        }
+        CHECK(command(true,false)["result"]=="failed");
+        CHECK(command(true,true,"open").isEmpty());
+        CHECK(!QJsonDocument::fromVariant(command()).toJson().contains("synthetic-private-hash"));
+        rest.ok=false;CHECK(command().isEmpty());
         std::cout << "PASS: " << checks << " access-event checks\n";
     } catch (const std::exception &e) {
         std::cerr << e.what() << "\n";

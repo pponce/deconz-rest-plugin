@@ -42,5 +42,33 @@ inline QVariantMap accessEvent(bool managed, const Result &result, const QString
     }
     return event; // Rejections never disclose matched user identity, PIN or hash.
 }
+// REST commands are a separate event type: NEVER a keypad/door activation.
+// An accepted request is not proof that an exit delay has finished or a siren sounded.
+inline QVariantMap restEvent(bool managed, const RestResult &result, const QString &alarm,
+                             const QString &operation, const QString &eventId, qint64 timestamp,
+                             bool applied)
+{
+    if (!managed || !result.ok || eventId.isEmpty() ||
+        (result.accepted && result.user.slot < 0) ||
+        (operation != "disarm" && operation != "arm_stay" &&
+         operation != "arm_night" && operation != "arm_away")) return {};
+    QVariantMap event;
+    event["t"] = "event";
+    event["e"] = "alarm_command";
+    event["r"] = "alarmsystems";
+    event["id"] = alarm;
+    event["source"] = "rest";
+    event["event_id"] = eventId;
+    event["action"] = operation;
+    event["result"] = !result.accepted ? "rejected" : applied ? "accepted" : "failed";
+    event["timestamp"] = QDateTime::fromMSecsSinceEpoch(timestamp, Qt::UTC).toString(Qt::ISODateWithMs);
+    event["uses_consumed"] = 0;
+    if (result.accepted) {
+        event["user_id"] = QString::fromStdString(result.user.id);
+        event["user_slot"] = result.user.slot;
+    }
+    return event;
+}
+
 }
 #endif

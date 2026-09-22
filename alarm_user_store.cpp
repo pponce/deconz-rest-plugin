@@ -192,15 +192,26 @@ bool Store::erase(int alarm, int slot, int64_t revision) {
     if (!exec(db,"DELETE FROM alarm_user_schedules_v1 WHERE uid NOT IN (SELECT uid FROM alarm_users_v1)")) return false;
     return activate(alarm) && t.commit();
 }
-bool Store::restCode(int alarm, const std::string &pin, int64_t now) {
+RestResult Store::authorizeRest(int alarm, const std::string &pin, int64_t now) {
+    RestResult result;
     if (now == -1) now = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
     std::vector<User> users;
-    if (!list(alarm,users)) return false;
-    for (const auto &u:users)
-        if (u.apiArmDisarm && u.enabled && u.remaining!=0 && verify(u.hash,pin))
-            return u.schedule.empty() || (now > 0 && scheduleCheck && scheduleCheck(u.schedule,now) == 1);
-    return false;
+    if (!list(alarm,users)) return result;
+    for (const auto &u:users) {
+        if (!u.apiArmDisarm || !u.enabled || u.remaining == 0 || !verify(u.hash,pin)) continue;
+        const int allowed = u.schedule.empty() ? 1 :
+            (now > 0 && scheduleCheck ? scheduleCheck(u.schedule,now) : -1);
+        if (allowed < 0) return result;
+        if (allowed == 1) { result.accepted = true; result.user = u; }
+        break;
+    }
+    result.ok = true;
+    return result;
+}
+bool Store::restCode(int alarm, const std::string &pin, int64_t now) {
+    const auto result = authorizeRest(alarm,pin,now);
+    return result.ok && result.accepted;
 }
 bool Store::setMainCode(int alarm, const std::string &pin) {
     if (!validPin(pin)) return false;
