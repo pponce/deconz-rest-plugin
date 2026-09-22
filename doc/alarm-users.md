@@ -64,6 +64,20 @@ requests update the user's revision, so clients must refetch after conflicts.
 REST arm/disarm requires a valid eligible code plus `api_arm_disarm:true`.
 Keypad access is independent of that REST permission.
 
+For REST arming/disarming, PUT `/api/<key>/alarmsystems/<alarm>/disarm`,
+`/arm_stay`, `/arm_night`, or `/arm_away` with `{"code0":"012345"}` (synthetic
+example only). The legacy field name remains `code0`, but managed mode checks all
+eligible API-enabled users, not just slot 0. This is an actual alarm command;
+do not call it merely to check whether a PIN is valid.
+
+User/lockout routes return JSON objects on success and deCONZ error arrays on
+failure. Inspect both HTTP status and error descriptions. Invalid fields or stale
+revisions normally yield HTTP 400; storage failures yield HTTP 503. Refetch after
+`revision_conflict`; never blindly retry a stale update. Relevant descriptions
+include `primary_user_protected`, `pin_already_assigned`, `invalid_schedule`,
+`invalid_lockout_policy` and `managed_users_required`. Transport errors leave the
+mutation result uncertain: read back before deciding whether to retry.
+
 ## Schedules
 
 Set `schedule:null` to remove all time restrictions. Otherwise send all four keys:
