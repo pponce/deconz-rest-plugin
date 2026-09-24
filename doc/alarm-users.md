@@ -133,8 +133,8 @@ provided across connection gaps.
 ## Lockout, schedules and timing
 
 Optional failed-PIN lockout remains scoped to alarm + physical source + endpoint.
-A wrong PIN cannot identify a user. Default policy is disabled, threshold 3 in
-60 seconds, durations `[60,1200,3600]`, quiet reset 86400 seconds. Durations must
+A wrong PIN cannot identify a user. Default policy is disabled, threshold 6 in
+60 seconds, durations `[60,600,1800]`, quiet reset 3600 seconds. These defaults apply when no policy has been saved; existing saved policies are unchanged. The threshold counts failed requests, not physical PIN-entry sessions. Durations must
 be ascending, 1–3600 seconds; threshold 1–100, window 1–3600, reset 3600–604800.
 PUT includes all policy fields and its revision. DELETE requires `{"reset":true}`.
 Active deadlines are preserved by enabled-policy edits. Disabling or explicit

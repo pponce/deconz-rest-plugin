@@ -24,9 +24,9 @@ struct User {
 };
 struct LockoutPolicy {
     bool enabled = false;
-    int threshold = 3, windowSeconds = 60;
-    int durations[3] = {60, 1200, 3600};
-    int resetSeconds = 86400;
+    int threshold = 6, windowSeconds = 60;
+    int durations[3] = {60, 600, 1800};
+    int resetSeconds = 3600;
     int64_t revision = 0;
 };
 struct LockoutState {

@@ -156,7 +156,13 @@ static void persistenceAndConcurrency() {
     auto duplicate=reopened.authorize(1,accepted,1,1,0,"2468",100001,true);
     CHECK(duplicate.ok&&duplicate.duplicate&&duplicate.eventId==eventId);
     CHECK(get(reopened,1,visitor.id).remaining==0);
-    LockoutPolicy policy;policy.enabled=true;policy.threshold=1;
+    LockoutPolicy policy;std::vector<LockoutState> states;
+    CHECK(reopened.lockout(1,policy,states));
+    CHECK(!policy.enabled&&policy.threshold==6&&policy.windowSeconds==60);
+    CHECK(policy.durations[0]==60&&policy.durations[1]==600&&policy.durations[2]==1800&&policy.resetSeconds==3600);
+    // Existing saved choices must survive reopen rather than adopting new defaults.
+    policy.enabled=true;policy.threshold=1;policy.windowSeconds=90;
+    policy.durations[0]=60;policy.durations[1]=1200;policy.durations[2]=3600;policy.resetSeconds=86400;
     CHECK(reopened.configureLockout(1,policy,0,error));
     auto locked=reopened.authorize(1,"abc",1,2,0,"9999",200000,false);
     CHECK(locked.locked&&locked.lockoutLevel==1);
@@ -167,6 +173,9 @@ static void persistenceAndConcurrency() {
     const auto until=locked.lockedUntil;
     CHECK(sqlite3_close(db)==SQLITE_OK);CHECK(sqlite3_open(path,&db)==SQLITE_OK);
     Store again(db,verify,hash);
+    LockoutPolicy saved;CHECK(again.lockout(1,saved,states));
+    CHECK(saved.enabled&&saved.threshold==1&&saved.windowSeconds==90);
+    CHECK(saved.durations[0]==60&&saved.durations[1]==1200&&saved.durations[2]==3600&&saved.resetSeconds==86400);
     CHECK(again.authorize(1,"abc",1,6,0,"1357",until-1,false).locked);
     CHECK(again.resetLockout(1));CHECK(again.authorize(1,"abc",1,7,0,"1357",until,false).response==0);
     CHECK(sqlite3_close(db)==SQLITE_OK);std::remove(path);
